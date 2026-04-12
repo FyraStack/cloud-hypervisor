@@ -26,6 +26,13 @@
   - [Mailing list](#mailing-list)
   - [Security issues](#security-issues)
 
+# fyra notes:
+
+basically we want to use this but it doesnt compile for riscv. so we are forking from v51.0 to make it work hopefully.
+
+we plan to downstream in the future once we figure things out.
+
+
 # 1. What is Cloud Hypervisor?
 
 Cloud Hypervisor is an open source Virtual Machine Monitor (VMM) that runs on

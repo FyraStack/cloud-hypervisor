@@ -1,0 +1,11 @@
+rva23 run notes
+
+1) setup a ubuntu 24.04.02 qemu rva23 sim (ask lea for details)
+2) do all of the getting started from this except cargo build: https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/docs/riscv.md
+3) run the native_compile/setup.sh file
+4) cargo build doesnt work due to failing tests. run `cargo build --bin cloud-hypervisor`
+5) then it wont work still cause it needs a supported hypervisor such as kvm or mshv. problem is default commands dont work.
+
+
+
+there is also cross_compile but it doesnt work due to issues with openssl rva23 cross compilation. it is written for fedora.
