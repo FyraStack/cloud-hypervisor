@@ -1,11 +1,21 @@
 rva23 run notes
 
-1) setup a ubuntu 24.04.02 qemu rva23 sim (ask lea for details)
+1) setup a ubuntu 24.04.02 qemu rva23 sim (ask lea for details), make sure it has kvm enabled.
 2) do all of the getting started from this except cargo build: https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/docs/riscv.md
 3) run the native_compile/setup.sh file
 4) cargo build doesnt work due to failing tests. run `cargo build --bin cloud-hypervisor`
-5) then it wont work still cause it needs a supported hypervisor such as kvm or mshv. problem is default commands dont work.
+5) this build took about 20-30 minutes on our hardware. i heavily recommend setting up mold and sccache to make it faster after first attempt.
+6) then run the compiled binary
+7) I (caleb/hero) am using odorobo to run the binary in a debug state, but using it directly and connecting over socket is likely better for debugging.
+8) the code for creating vms in odorobo does work so you should be able use it as a reference for that. its in odorobo-agent/src/state
+
+
+unfortunately running the binary currently doesnt work due to panic in hypervisor/src/kvm/mod.rs L1151, which runs Kvm::new().
+This is likely due to unsafe code inside of the kvm bindings, but I haven't been able to figure it out due to some weird issue with backtraces.
+Should work on it within the next few days at worst (4/15)
 
 
 
-there is also cross_compile but it doesnt work due to issues with openssl rva23 cross compilation. it is written for fedora.
+there is also cross_compile but it doesnt work due to issues with openssl rva23 cross compilation.
+it is written for fedora (or fedora based distros).
+if you can figure out how to make openssl work that would be good too.
