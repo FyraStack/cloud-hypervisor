@@ -92,6 +92,10 @@ uuid = { version = "1.21.0" }
 wait-timeout = "0.2.1"
 zerocopy = { version = "0.8.39", default-features = false }
 
+[patch.crates-io]
+kvm-ioctls = { path = "kvm/kvm-ioctls"}
+
+
 [workspace.lints.clippy]
 # Any clippy lint (group) in alphabetical order:
 # https://rust-lang.github.io/rust-clippy/master/index.html
