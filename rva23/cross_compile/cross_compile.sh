@@ -9,5 +9,4 @@ export CARGO_TARGET_RISCV64A23_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C linker=/home/cale
 cargo build --release --verbose
 
 
-# cross compile or just in 
-# wait
+# theoretically would cross compile, but openssl doesnt know how to cross compile for riscv on the hardware we did this on.
