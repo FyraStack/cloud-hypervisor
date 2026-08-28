@@ -17,10 +17,11 @@ pub enum Error {
     CreateAia(#[source] HypervisorVmError),
     /// Error while setting device attributes for the AIA.
     #[error(
-        "failed setting RISC-V AIA device attribute {operation} (group={group}, attr={attr}, value_address={value_address:#x}): {source}"
+        "failed setting RISC-V AIA device attribute {operation} ({value}) (group={group}, attr={attr}, value_address={value_address:#x}): {source}"
     )]
     SetDeviceAttribute {
         operation: String,
+        value: String,
         group: u32,
         attr: u64,
         value_address: u64,

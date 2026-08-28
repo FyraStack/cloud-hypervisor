@@ -112,6 +112,9 @@ pub const PCI_HIGH_BASE: GuestAddress = GuestAddress(0x2_0000_0000);
 /// First usable interrupt on riscv64
 pub const IRQ_BASE: u32 = 0;
 
-// As per https://elixir.bootlin.com/linux/v6.10/source/arch/riscv/include/asm/kvm_host.h#L31
-/// Number of supported interrupts
-pub const IRQ_NUM: u32 = 1023;
+/// Number of guest external interrupts supported by the K3-One host KVM.
+///
+/// The board's kernel reports: "AIA available with 7 guest external interrupts".
+/// Keep this aligned with that host limit until the interrupt count is negotiated
+/// from KVM instead of using a platform-wide constant.
+pub const IRQ_NUM: u32 = 7;

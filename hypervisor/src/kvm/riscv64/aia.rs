@@ -56,6 +56,7 @@ impl KvmAiaImsics {
         Self::set_device_attribute(
             &self.device,
             "config sources",
+            format!("nr_irqs={nr_irqs}"),
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_SRCS),
             &nr_irqs as *const u32 as u64,
@@ -80,6 +81,7 @@ impl KvmAiaImsics {
         Self::set_device_attribute(
             &self.device,
             "config hart bits",
+            format!("hart_bits={hart_bits}"),
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_HART_BITS),
             &hart_bits as *const u32 as u64,
@@ -92,6 +94,7 @@ impl KvmAiaImsics {
         Self::set_device_attribute(
             &self.device,
             "APLIC address",
+            format!("address={:#x}", self.aplic_addr),
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_ADDR,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_ADDR_APLIC),
             &self.aplic_addr as *const u64 as u64,
@@ -110,6 +113,7 @@ impl KvmAiaImsics {
             Self::set_device_attribute(
                 &self.device,
                 "IMSIC address",
+                format!("cpu_index={cpu_index}, address={cpu_imsic_addr:#x}"),
                 kvm_bindings::KVM_DEV_RISCV_AIA_GRP_ADDR,
                 riscv_imsic_attr_of(cpu_index),
                 &cpu_imsic_addr as *const u64 as u64,
@@ -121,6 +125,7 @@ impl KvmAiaImsics {
         Self::set_device_attribute(
             &self.device,
             "initialize",
+            "no value".to_owned(),
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CTRL,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CTRL_INIT),
             0,
@@ -170,6 +175,7 @@ impl KvmAiaImsics {
     fn set_device_attribute(
         device: &DeviceFd,
         operation: &str,
+        value: String,
         group: u32,
         attr: u64,
         addr: u64,
@@ -182,12 +188,13 @@ impl KvmAiaImsics {
             addr,
         };
         debug!(
-            "setting RISC-V AIA device attribute: operation={operation}, group={group}, attr={attr}, value_address={addr:#x}, flags={flags}"
+            "setting RISC-V AIA device attribute: operation={operation}, value={value}, group={group}, attr={attr}, value_address={addr:#x}, flags={flags}"
         );
         device
             .set_device_attr(&device_attr)
             .map_err(|e| Error::SetDeviceAttribute {
                 operation: operation.to_owned(),
+                value,
                 group,
                 attr,
                 value_address: addr,
