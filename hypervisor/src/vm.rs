@@ -73,6 +73,10 @@ pub enum HypervisorVmError {
     /// Un register interrupt event error
     #[error("Failed to unregister interrupt event")]
     UnregisterIrqFd(#[source] anyhow::Error),
+    /// Set interrupt line level error
+    #[cfg(target_arch = "riscv64")]
+    #[error("Failed to set interrupt line level")]
+    SetIrqLine(#[source] anyhow::Error),
     /// Register IO event error
     #[error("Failed to register IO event")]
     RegisterIoEvent(#[source] anyhow::Error),
@@ -255,6 +259,9 @@ pub trait Vm: Send + Sync + Any {
     fn create_vgic(&self, config: &VgicConfig) -> Result<Arc<Mutex<dyn Vgic>>>;
     #[cfg(target_arch = "riscv64")]
     fn create_vaia(&self, config: &VaiaConfig) -> Result<Arc<Mutex<dyn Vaia>>>;
+    /// Sets the level of a wired interrupt source of the in-kernel interrupt controller.
+    #[cfg(target_arch = "riscv64")]
+    fn set_irq_line(&self, irq: u32, level: bool) -> Result<()>;
 
     /// Registers an event to be signaled whenever a certain address is written to.
     fn register_ioevent(

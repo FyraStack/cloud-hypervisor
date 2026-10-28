@@ -872,6 +872,14 @@ impl vm::Vm for KvmVm {
         Ok(Arc::new(Mutex::new(aia_device)))
     }
 
+    #[cfg(target_arch = "riscv64")]
+    /// Sets the level of an APLIC interrupt source.
+    fn set_irq_line(&self, irq: u32, level: bool) -> vm::Result<()> {
+        self.fd
+            .set_irq_line(irq, level)
+            .map_err(|e| vm::HypervisorVmError::SetIrqLine(e.into()))
+    }
+
     /// Registers an event to be signaled whenever a certain address is written to.
     fn register_ioevent(
         &self,

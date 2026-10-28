@@ -3,8 +3,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-use std::result;
 use std::sync::{Arc, Mutex};
+use std::{io, result};
 
 use arch::layout;
 use hypervisor::arch::riscv64::aia::{Vaia, VaiaConfig};
@@ -35,6 +35,7 @@ pub struct Aia {
     interrupt_source_group: Arc<dyn InterruptSourceGroup>,
     // The hypervisor agnostic virtual AIA
     vaia: Arc<Mutex<dyn Vaia>>,
+    vm: Arc<dyn hypervisor::Vm>,
 }
 
 impl Aia {
@@ -57,6 +58,7 @@ impl Aia {
         let aia = Aia {
             interrupt_source_group,
             vaia,
+            vm,
         };
         aia.enable()?;
 
@@ -112,9 +114,15 @@ impl InterruptController for Aia {
     // This should be called anytime an interrupt needs to be injected into the
     // running guest.
     fn service_irq(&mut self, irq: usize) -> Result<()> {
-        self.interrupt_source_group
-            .trigger(irq as InterruptIndex)
-            .map_err(Error::TriggerInterrupt)?;
+        // Pulse the line instead of signaling the irqfd: KVM handles irqfds
+        // routed to the APLIC by raising the line without ever lowering it.
+        // The source then stays asserted, so a level-triggered interrupt is
+        // re-pended forever by the guest at EOI, and an edge-triggered one
+        // never fires again.
+        self.vm
+            .set_irq_line(irq as u32, true)
+            .and_then(|()| self.vm.set_irq_line(irq as u32, false))
+            .map_err(|e| Error::TriggerInterrupt(io::Error::other(e)))?;
 
         Ok(())
     }

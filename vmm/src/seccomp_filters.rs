@@ -561,10 +561,18 @@ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError>
     Ok(arch_rules)
 }
 
+// Wired interrupts are pulsed with KVM_IRQ_LINE on riscv64, from any thread
+// emulating a legacy device (see devices::aia::Aia::service_irq()).
+#[cfg(all(target_arch = "riscv64", feature = "kvm"))]
+const KVM_IRQ_LINE: u64 = 0x4008_ae61;
+
 #[cfg(all(target_arch = "riscv64", feature = "kvm"))]
 fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError> {
+    let mut arch_rules = or![and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQ_LINE)?],];
     let common_rules = create_vmm_ioctl_seccomp_rule_common(HypervisorType::Kvm)?;
-    Ok(common_rules)
+    arch_rules.extend(common_rules);
+
+    Ok(arch_rules)
 }
 
 #[cfg(feature = "mshv")]
@@ -588,7 +596,11 @@ fn create_api_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, BackendError> {
 }
 
 fn create_serial_manager_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, BackendError> {
-    Ok(or![and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?]])
+    Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?],
+        #[cfg(all(target_arch = "riscv64", feature = "kvm"))]
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQ_LINE)?],
+    ])
 }
 
 // Syscalls needed by all threads, because they are used in the seccomp signal
@@ -881,6 +893,8 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CHECK_EXTENSION,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IOEVENTFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD,)?],
+        #[cfg(target_arch = "riscv64")]
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQ_LINE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GSI_ROUTING,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION,)?],
