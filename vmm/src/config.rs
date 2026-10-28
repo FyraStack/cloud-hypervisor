@@ -224,6 +224,10 @@ pub enum ValidationError {
     /// Too many CPUs.
     #[error("Too many CPUs: specified {0} but {MAX_SUPPORTED_CPUS} is the limit")]
     TooManyCpus(u32 /* specified CPUs */),
+    #[cfg(target_arch = "riscv64")]
+    /// CPU hotplug is not supported on riscv64
+    #[error("CPU hotplug is not supported on riscv64: max ({0}) must be equal to boot ({1})")]
+    CpuHotplugNotSupported(u32 /* max_vcpus */, u32 /* boot_vcpus */),
     #[cfg(target_arch = "aarch64")]
     /// The GICv3 layout does not fit this many CPUs.
     #[error("Too many CPUs for the GICv3 layout: specified {0} but {1} is the limit")]
@@ -3639,6 +3643,16 @@ impl VmConfig {
         #[cfg(target_arch = "aarch64")]
         validate_gic_layout(self.cpus.max_vcpus)?;
 
+        // The AIA is sized for the boot vCPUs and KVM doesn't support adding
+        // vCPUs once it is initialized.
+        #[cfg(target_arch = "riscv64")]
+        if self.cpus.max_vcpus != self.cpus.boot_vcpus {
+            return Err(ValidationError::CpuHotplugNotSupported(
+                self.cpus.max_vcpus,
+                self.cpus.boot_vcpus,
+            ));
+        }
+
         if let Some(affinity) = &self.cpus.affinity {
             for affinity in affinity.iter().flat_map(|affinity| &affinity.host_cpus) {
                 let max_affinity = 8 * size_of::<libc::cpu_set_t>();
@@ -6640,6 +6654,17 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::TooManyCpus(MAX_SUPPORTED_CPUS + 1))
         );
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            let mut invalid_config = valid_config.clone();
+            invalid_config.cpus.max_vcpus = 4;
+            invalid_config.cpus.boot_vcpus = 2;
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::CpuHotplugNotSupported(4, 2))
+            );
+        }
 
         #[cfg(target_arch = "x86_64")]
         {
