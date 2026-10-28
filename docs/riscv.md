@@ -161,9 +161,34 @@ https://canonical-ubuntu-boards.readthedocs-hosted.com/en/latest/how-to/qemu-ris
 
 https://www.qemu.org/docs/master/specs/riscv-aia.html
 
+## Multiple vCPUs, topology and NUMA
+
+Guests can have several vCPUs, described in the FDT together with the CPU
+topology and the NUMA nodes. Each die of the topology is described as a
+cluster, so for example two clusters of four cores are booted with:
+
+```console
+--cpus boot=8,topology=1:4:2:1
+```
+
+and two NUMA nodes with:
+
+```console
+--memory size=0 \
+--memory-zone id=mem0,size=512M id=mem1,size=512M \
+--numa guest_numa_id=0,cpus=[0-3],memory_zones=mem0,distances=[1@20] \
+       guest_numa_id=1,cpus=[4-7],memory_zones=mem1
+```
+
+The AIA hardware has a limited number of guest interrupt files per host hart
+(e.g. 7 on the SpacemiT K3). KVM falls back to emulating the interrupt files of
+the vCPUs that don't get one, so more vCPUs than that can share a host hart, at
+a performance cost.
+
 ## Known limitations
 
 - Direct kernel boot only
 - `64-bit Linux` guest OS only
+- No CPU hotplug: the maximum number of vCPUs must be the boot number
 - For more details, see
   [here](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/6978).
