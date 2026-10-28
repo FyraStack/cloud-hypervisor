@@ -1938,6 +1938,16 @@ impl Vm {
             .map(|f| f as u32)
             .unwrap_or(0x989680);
 
+        // An empty list makes arch fall back to the host ISA from /proc/cpuinfo.
+        let isa_extensions = self
+            .cpu_manager
+            .lock()
+            .unwrap()
+            .vcpus()
+            .first()
+            .and_then(|vcpu| vcpu.lock().unwrap().get_isa_extensions().ok())
+            .unwrap_or_default();
+
         arch::configure_system(
             &mem,
             cmdline.as_cstring().unwrap().to_str().unwrap(),
@@ -1947,6 +1957,7 @@ impl Vm {
             &pci_space_info,
             &vaia,
             timebase_frequency,
+            &isa_extensions,
         )
         .map_err(Error::ConfigureSystem)?;
 

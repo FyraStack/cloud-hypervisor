@@ -673,6 +673,13 @@ impl Vcpu {
         self.vcpu.get_timebase_frequency()
     }
 
+    #[cfg(target_arch = "riscv64")]
+    pub fn get_isa_extensions(
+        &self,
+    ) -> result::Result<Vec<String>, hypervisor::HypervisorCpuError> {
+        self.vcpu.get_isa_extensions()
+    }
+
     #[cfg(feature = "sev_snp")]
     pub fn set_sev_control_register(&self, vmsa_pfn: u64) -> Result<()> {
         self.vcpu

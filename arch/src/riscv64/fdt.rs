@@ -67,6 +67,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
     cmdline: &str,
     num_vcpu: u32,
     isa_string: &str,
+    isa_extensions: &[String],
     device_info: &HashMap<(DeviceType, String), T, S>,
     aia_device: &Arc<Mutex<dyn Vaia>>,
     initrd: &Option<InitramfsConfig>,
@@ -87,7 +88,13 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
     // Properties
     fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
     fdt.property_u32("#size-cells", SIZE_CELLS)?;
-    create_cpu_nodes(&mut fdt, num_vcpu, isa_string, timebase_frequency)?;
+    create_cpu_nodes(
+        &mut fdt,
+        num_vcpu,
+        isa_string,
+        isa_extensions,
+        timebase_frequency,
+    )?;
     create_memory_node(&mut fdt, guest_mem)?;
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_aia_node(&mut fdt, aia_device)?;
@@ -115,6 +122,7 @@ fn create_cpu_nodes(
     fdt: &mut FdtWriter,
     num_cpus: u32,
     isa_string: &str,
+    isa_extensions: &[String],
     timebase_frequency: u32,
 ) -> FdtWriterResult<()> {
     // See https://elixir.bootlin.com/linux/v6.10/source/Documentation/devicetree/bindings/riscv/cpus.yaml
@@ -129,7 +137,10 @@ fn create_cpu_nodes(
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "riscv")?;
         fdt.property_string("mmu-type", "sv48")?;
+        // "riscv,isa" is deprecated, but older kernels only parse it.
         fdt.property_string("riscv,isa", isa_string)?;
+        fdt.property_string("riscv,isa-base", "rv64i")?;
+        fdt.property_string_list("riscv,isa-extensions", isa_extensions.to_vec())?;
         fdt.property_string("status", "okay")?;
         fdt.property_u32("reg", cpu_index)?;
         fdt.property_u32("phandle", CPU_BASE_PHANDLE + cpu_index)?;

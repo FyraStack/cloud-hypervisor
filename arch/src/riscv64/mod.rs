@@ -122,9 +122,9 @@ pub fn arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
     ]
 }
 
-// Read the first "isa" string from /proc/cpuinfo and filter out the H extension,
-// while correctly preserving multi-letter extensions.
-fn isa_string_from_host() -> Result<String, Error> {
+// Read the first "isa" string from /proc/cpuinfo and split it into extension names,
+// filtering out the H extension. Used when the hypervisor cannot report the guest ISA.
+fn isa_extensions_from_host() -> Result<Vec<String>, Error> {
     let file = File::open("/proc/cpuinfo").map_err(Error::OpenCpuInfo)?;
     let reader = BufReader::new(file);
 
@@ -135,23 +135,7 @@ fn isa_string_from_host() -> Result<String, Error> {
         if trimmed_line.starts_with("isa") {
             let parts: Vec<&str> = trimmed_line.split(':').collect();
             if parts.len() == 2 {
-                let isa_string = parts[1].trim();
-
-                // Split the string by underscores to separate single letter vs long-form
-                // extensions
-                let mut components: Vec<String> =
-                    isa_string.split('_').map(|s| s.to_string()).collect();
-
-                if components.is_empty() {
-                    return Err(Error::InvalidIsaString(isa_string.to_string()));
-                }
-
-                // Remove H extension if present in single letter extensions
-                let first_component = components[0].chars().filter(|&c| c != 'h').collect();
-
-                components[0] = first_component;
-
-                return Ok(components.join("_"));
+                return isa_extensions_from_isa_string(parts[1].trim());
             }
         }
     }
@@ -159,7 +143,41 @@ fn isa_string_from_host() -> Result<String, Error> {
     Err(Error::CpuInfoParsing)
 }
 
+// Split an ISA string such as "rv64imafdch_zicbom_zicboz" into extension names,
+// dropping the H extension.
+fn isa_extensions_from_isa_string(isa_string: &str) -> Result<Vec<String>, Error> {
+    let mut components = isa_string.split('_');
+    let single_letter = components
+        .next()
+        .and_then(|base| base.strip_prefix("rv64"))
+        .ok_or_else(|| Error::InvalidIsaString(isa_string.to_string()))?;
+
+    Ok(single_letter
+        .chars()
+        .filter(|&c| c != 'h')
+        .map(|c| c.to_string())
+        .chain(components.filter(|s| !s.is_empty()).map(str::to_string))
+        .collect())
+}
+
+// Build the legacy "riscv,isa" string from extension names: the single-letter
+// extensions in canonical order, then the multi-letter ones separated by '_'.
+fn isa_string_from_extensions(extensions: &[String]) -> String {
+    let mut isa_string = String::from("rv64");
+    for c in "imafdqlcbjtpvh".chars() {
+        if extensions.iter().any(|e| e.len() == 1 && e.starts_with(c)) {
+            isa_string.push(c);
+        }
+    }
+    for extension in extensions.iter().filter(|e| e.len() > 1) {
+        isa_string.push('_');
+        isa_string.push_str(extension);
+    }
+    isa_string
+}
+
 /// Configures the system and should be called once per vm before starting vcpu threads.
+#[expect(clippy::too_many_arguments)]
 pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHasher>(
     guest_mem: &GuestMemoryMmap,
     cmdline: &str,
@@ -169,13 +187,20 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
     pci_space_info: &[PciSpaceInfo],
     aia_device: &Arc<Mutex<dyn Vaia>>,
     timebase_frequency: u32,
+    isa_extensions: &[String],
 ) -> super::Result<()> {
-    let isa_string = isa_string_from_host()?;
+    let isa_extensions = if isa_extensions.is_empty() {
+        isa_extensions_from_host()?
+    } else {
+        isa_extensions.to_vec()
+    };
+    let isa_string = isa_string_from_extensions(&isa_extensions);
     let fdt_final = fdt::create_fdt(
         guest_mem,
         cmdline,
         num_vcpu,
         &isa_string,
+        &isa_extensions,
         device_info,
         aia_device,
         initrd,
@@ -228,5 +253,27 @@ mod tests {
         assert_eq!(4, regions.len());
         assert_eq!(layout::RAM_START, regions[3].0);
         assert_eq!(RegionType::Ram, regions[3].2);
+    }
+
+    #[test]
+    fn test_isa_extensions_from_isa_string() {
+        assert_eq!(
+            isa_extensions_from_isa_string("rv64imafdcvh_zicbom_zicboz").unwrap(),
+            ["i", "m", "a", "f", "d", "c", "v", "zicbom", "zicboz"]
+        );
+        isa_extensions_from_isa_string("rv32imac").unwrap_err();
+    }
+
+    #[test]
+    fn test_isa_string_from_extensions() {
+        // KVM reports extensions in enum order, not canonical order.
+        let extensions: Vec<String> = ["a", "c", "d", "f", "i", "m", "sstc", "v", "zicbom"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            isa_string_from_extensions(&extensions),
+            "rv64imafdcv_sstc_zicbom"
+        );
     }
 }

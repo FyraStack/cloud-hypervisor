@@ -337,6 +337,12 @@ pub trait Vcpu: Send + Sync {
     fn get_timebase_frequency(&self) -> Result<u64> {
         Ok(0)
     }
+    /// Get the ISA extensions exposed to the guest on RISC-V 64-bit, using the
+    /// devicetree `riscv,isa-extensions` names (e.g. "i", "m", "zicbom").
+    #[cfg(target_arch = "riscv64")]
+    fn get_isa_extensions(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     /// Configure core registers for a given CPU.
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     fn setup_regs(

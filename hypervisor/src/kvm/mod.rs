@@ -2719,6 +2719,20 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "riscv64")]
+    fn get_isa_extensions(&self) -> cpu::Result<Vec<String>> {
+        let mut extensions = Vec::new();
+        for (index, name) in riscv64::ISA_EXT_NAMES.iter().enumerate() {
+            let id = riscv64::isa_ext_reg_id(index as u64);
+            let mut bytes = [0u8; 8];
+            // Extensions unknown to the running kernel are rejected: skip them.
+            if self.fd.get_one_reg(id, &mut bytes).is_ok() && u64::from_le_bytes(bytes) != 0 {
+                extensions.push((*name).to_string());
+            }
+        }
+        Ok(extensions)
+    }
+
+    #[cfg(target_arch = "riscv64")]
     fn get_timebase_frequency(&self) -> cpu::Result<u64> {
         use kvm_bindings::kvm_riscv_timer;
         let freq_offset = offset_of!(kvm_riscv_timer, frequency);
@@ -3753,6 +3767,30 @@ mod tests {
         }
         vcpu.memory_slots = None;
         vcpu.validate_gpa_range(0x1000, 1).unwrap_err();
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn test_get_isa_extensions() {
+        use super::*;
+
+        let kvm = KvmHypervisor::new().unwrap();
+        let hypervisor = Arc::new(kvm);
+        let vm = hypervisor
+            .create_vm(HypervisorVmConfig::default())
+            .expect("new VM fd creation failed");
+        let vcpu0 = vm.create_vcpu(0, None).unwrap();
+
+        let extensions = vcpu0.get_isa_extensions().unwrap();
+        // The base ISA is always available to the guest.
+        for base in ["i", "m", "a"] {
+            assert!(extensions.iter().any(|e| e == base), "{extensions:?}");
+        }
+        // Every extension is reported once, with its devicetree name.
+        for (i, extension) in extensions.iter().enumerate() {
+            assert!(riscv64::ISA_EXT_NAMES.contains(&extension.as_str()));
+            assert!(!extensions[i + 1..].contains(extension));
+        }
     }
 
     #[test]

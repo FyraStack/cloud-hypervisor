@@ -5,8 +5,9 @@
 pub mod aia;
 
 use kvm_bindings::{
-    KVM_REG_RISCV_CORE, KVM_REG_RISCV_TYPE_MASK, KVM_REG_SIZE_MASK, KVM_REG_SIZE_U64, kvm_mp_state,
-    kvm_one_reg, kvm_riscv_core,
+    KVM_REG_RISCV, KVM_REG_RISCV_CORE, KVM_REG_RISCV_ISA_EXT, KVM_REG_RISCV_ISA_SINGLE,
+    KVM_REG_RISCV_TYPE_MASK, KVM_REG_SIZE_MASK, KVM_REG_SIZE_U64, kvm_mp_state, kvm_one_reg,
+    kvm_riscv_core,
 };
 pub use kvm_ioctls::{Cap, Kvm};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,100 @@ macro_rules! riscv64_reg_id {
             | u64::from(kvm_bindings::KVM_REG_SIZE_U64)
             | (($offset / size_of::<u64>()) as u64)
     };
+}
+
+/// Devicetree names of the KVM ISA extensions, indexed by `enum KVM_RISCV_ISA_EXT_ID`
+/// (arch/riscv/include/uapi/asm/kvm.h). The enum is uAPI, so it is append-only.
+pub const ISA_EXT_NAMES: &[&str] = &[
+    "a",
+    "c",
+    "d",
+    "f",
+    "h",
+    "i",
+    "m",
+    "svpbmt",
+    "sstc",
+    "svinval",
+    "zihintpause",
+    "zicbom",
+    "zicboz",
+    "zbb",
+    "ssaia",
+    "v",
+    "svnapot",
+    "zba",
+    "zbs",
+    "zicntr",
+    "zicsr",
+    "zifencei",
+    "zihpm",
+    "smstateen",
+    "zicond",
+    "zbc",
+    "zbkb",
+    "zbkc",
+    "zbkx",
+    "zknd",
+    "zkne",
+    "zknh",
+    "zkr",
+    "zksed",
+    "zksh",
+    "zkt",
+    "zvbb",
+    "zvbc",
+    "zvkb",
+    "zvkg",
+    "zvkned",
+    "zvknha",
+    "zvknhb",
+    "zvksed",
+    "zvksh",
+    "zvkt",
+    "zfh",
+    "zfhmin",
+    "zihintntl",
+    "zvfh",
+    "zvfhmin",
+    "zfa",
+    "ztso",
+    "zacas",
+    "sscofpmf",
+    "zimop",
+    "zca",
+    "zcb",
+    "zcd",
+    "zcf",
+    "zcmop",
+    "zawrs",
+    "smnpm",
+    "ssnpm",
+    "svade",
+    "svadu",
+    "svvptc",
+    "zabha",
+    "ziccrse",
+    "zaamo",
+    "zalrsc",
+    "zicbop",
+    "zfbfmin",
+    "zvfbfmin",
+    "zvfbfwma",
+    "zclsd",
+    "zilsd",
+    "zalasr",
+    "zicfilp",
+    "zicfiss",
+];
+
+/// Get the ID of the single-extension `KVM_REG_RISCV_ISA_EXT` register for `index`.
+pub fn isa_ext_reg_id(index: u64) -> u64 {
+    KVM_REG_RISCV as u64
+        | KVM_REG_SIZE_U64
+        | u64::from(KVM_REG_RISCV_ISA_EXT)
+        | u64::from(KVM_REG_RISCV_ISA_SINGLE)
+        | index
 }
 
 /// Specifies whether a particular register is a core register or not.
