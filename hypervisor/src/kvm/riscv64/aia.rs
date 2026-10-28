@@ -46,6 +46,7 @@ impl KvmAiaImsics {
         let mut aia_mode_readback: u32 = 0;
         Self::get_device_attribute(
             &self.device,
+            "config mode",
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_MODE),
             &raw mut aia_mode_readback as u64,
@@ -59,6 +60,7 @@ impl KvmAiaImsics {
         let mut aia_nr_ids: u32 = 0;
         Self::get_device_attribute(
             &self.device,
+            "config ids",
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_IDS),
             &raw mut aia_nr_ids as u64,
@@ -74,6 +76,7 @@ impl KvmAiaImsics {
         );
         Self::set_device_attribute(
             &self.device,
+            "config srcs",
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_SRCS),
             &raw const safe_nr_irqs as u64,
@@ -86,6 +89,7 @@ impl KvmAiaImsics {
         debug!("Configuring AIA hart bits: {}", hart_bits);
         Self::set_device_attribute(
             &self.device,
+            "config hart bits",
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_HART_BITS),
             &raw const hart_bits as u64,
@@ -98,6 +102,7 @@ impl KvmAiaImsics {
         debug!("Configuring AIA APLIC address: {:#x}", self.aplic_addr);
         Self::set_device_attribute(
             &self.device,
+            "APLIC address",
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_ADDR,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_ADDR_APLIC),
             &raw const self.aplic_addr as u64,
@@ -119,6 +124,7 @@ impl KvmAiaImsics {
             );
             Self::set_device_attribute(
                 &self.device,
+                "IMSIC address",
                 kvm_bindings::KVM_DEV_RISCV_AIA_GRP_ADDR,
                 riscv_imsic_attr_of(cpu_index),
                 &raw const cpu_imsic_addr as u64,
@@ -130,6 +136,7 @@ impl KvmAiaImsics {
         debug!("Initializing AIA device");
         Self::set_device_attribute(
             &self.device,
+            "init",
             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CTRL,
             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CTRL_INIT),
             0,
@@ -156,6 +163,7 @@ impl KvmAiaImsics {
     /// Get an AIA device attribute
     fn get_device_attribute(
         device: &DeviceFd,
+        name: &'static str,
         group: u32,
         attr: u64,
         addr: u64,
@@ -169,15 +177,21 @@ impl KvmAiaImsics {
         };
         // SAFETY: attr.addr is safe to write to.
         unsafe {
-            device.get_device_attr(&mut attr).map_err(|e| {
-                Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
-            })
+            device
+                .get_device_attr(&mut attr)
+                .map_err(|e| Error::GetDeviceAttribute {
+                    name,
+                    group,
+                    attr: attr.attr,
+                    source: HypervisorDeviceError::GetDeviceAttribute(e.into()),
+                })
         }
     }
 
     /// Set an AIA device attribute
     fn set_device_attribute(
         device: &DeviceFd,
+        name: &'static str,
         group: u32,
         attr: u64,
         addr: u64,
@@ -189,9 +203,14 @@ impl KvmAiaImsics {
             attr,
             addr,
         };
-        device.set_device_attr(&attr).map_err(|e| {
-            Error::SetDeviceAttribute(HypervisorDeviceError::SetDeviceAttribute(e.into()))
-        })
+        device
+            .set_device_attr(&attr)
+            .map_err(|e| Error::SetDeviceAttribute {
+                name,
+                group,
+                attr: attr.attr,
+                source: HypervisorDeviceError::SetDeviceAttribute(e.into()),
+            })
     }
 
     /// Method to initialize the AIA device

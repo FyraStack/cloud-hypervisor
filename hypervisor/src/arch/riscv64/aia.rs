@@ -15,11 +15,23 @@ pub enum Error {
     #[error("Failed creating AIA device")]
     CreateAia(#[source] HypervisorVmError),
     /// Error while setting device attributes for the AIA.
-    #[error("Failed setting device attributes for the AIA")]
-    SetDeviceAttribute(#[source] HypervisorDeviceError),
+    #[error("Failed setting AIA device attribute {name} (group {group}, attr {attr})")]
+    SetDeviceAttribute {
+        name: &'static str,
+        group: u32,
+        attr: u64,
+        #[source]
+        source: HypervisorDeviceError,
+    },
     /// Error while getting device attributes for the AIA.
-    #[error("Failed getting device attributes for the AIA")]
-    GetDeviceAttribute(#[source] HypervisorDeviceError),
+    #[error("Failed getting AIA device attribute {name} (group {group}, attr {attr})")]
+    GetDeviceAttribute {
+        name: &'static str,
+        group: u32,
+        attr: u64,
+        #[source]
+        source: HypervisorDeviceError,
+    },
 }
 pub type Result<T> = result::Result<T, Error>;
 

@@ -868,7 +868,7 @@ impl vm::Vm for KvmVm {
     /// Creates a virtual AIA device.
     fn create_vaia(&self, config: &VaiaConfig) -> vm::Result<Arc<Mutex<dyn Vaia>>> {
         let aia_device = KvmAiaImsics::new(self, config)
-            .map_err(|e| vm::HypervisorVmError::CreateVaia(anyhow!("Vaia error {e:?}")))?;
+            .map_err(|e| vm::HypervisorVmError::CreateVaia(e.into()))?;
         Ok(Arc::new(Mutex::new(aia_device)))
     }
 
