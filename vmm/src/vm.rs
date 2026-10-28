@@ -1948,6 +1948,8 @@ impl Vm {
             .and_then(|vcpu| vcpu.lock().unwrap().get_isa_extensions().ok())
             .unwrap_or_default();
 
+        let vcpu_topology = self.cpu_manager.lock().unwrap().get_vcpu_topology();
+
         arch::configure_system(
             &mem,
             cmdline.as_cstring().unwrap().to_str().unwrap(),
@@ -1958,6 +1960,7 @@ impl Vm {
             &vaia,
             timebase_frequency,
             &isa_extensions,
+            vcpu_topology,
         )
         .map_err(Error::ConfigureSystem)?;
 

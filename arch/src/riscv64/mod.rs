@@ -188,6 +188,7 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
     aia_device: &Arc<Mutex<dyn Vaia>>,
     timebase_frequency: u32,
     isa_extensions: &[String],
+    vcpu_topology: Option<(u16, u16, u16, u16)>,
 ) -> super::Result<()> {
     let isa_extensions = if isa_extensions.is_empty() {
         isa_extensions_from_host()?
@@ -201,6 +202,7 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
         num_vcpu,
         &isa_string,
         &isa_extensions,
+        vcpu_topology,
         device_info,
         aia_device,
         initrd,
