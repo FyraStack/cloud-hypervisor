@@ -22,7 +22,7 @@ use thiserror::Error;
 use vm_memory::{Address, GuestAddress, GuestMemoryAtomic, GuestMemoryBackend};
 
 pub use self::fdt::DeviceInfoForFdt;
-use crate::{DeviceType, GuestMemoryMmap, PciSpaceInfo, RegionType};
+use crate::{DeviceType, GuestMemoryMmap, NumaNodes, PciSpaceInfo, RegionType};
 
 pub const CLOUDHV_IRQCHIP_NUM_MSIS: u16 = 255;
 pub const CLOUDHV_IRQCHIP_NUM_SOURCES: u8 = 96;
@@ -189,6 +189,7 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
     timebase_frequency: u32,
     isa_extensions: &[String],
     vcpu_topology: Option<(u16, u16, u16, u16)>,
+    numa_nodes: &NumaNodes,
 ) -> super::Result<()> {
     let isa_extensions = if isa_extensions.is_empty() {
         isa_extensions_from_host()?
@@ -203,6 +204,7 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
         &isa_string,
         &isa_extensions,
         vcpu_topology,
+        numa_nodes,
         device_info,
         aia_device,
         initrd,

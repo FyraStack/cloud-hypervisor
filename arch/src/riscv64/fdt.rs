@@ -25,7 +25,7 @@ use super::layout::{
     IRQ_BASE, MEM_32BIT_DEVICES_SIZE, MEM_32BIT_DEVICES_START, MEM_PCI_IO_SIZE, MEM_PCI_IO_START,
     PCI_HIGH_BASE, PCI_MMIO_CONFIG_SIZE_PER_SEGMENT,
 };
-use crate::PciSpaceInfo;
+use crate::{NumaNode, NumaNodes, PciSpaceInfo};
 
 const AIA_APLIC_PHANDLE: u32 = 1;
 const AIA_IMSIC_PHANDLE: u32 = 2;
@@ -69,6 +69,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
     isa_string: &str,
     isa_extensions: &[String],
     vcpu_topology: Option<(u16, u16, u16, u16)>,
+    numa_nodes: &NumaNodes,
     device_info: &HashMap<(DeviceType, String), T, S>,
     aia_device: &Arc<Mutex<dyn Vaia>>,
     initrd: &Option<InitramfsConfig>,
@@ -95,13 +96,17 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
         isa_string,
         isa_extensions,
         vcpu_topology,
+        numa_nodes,
         timebase_frequency,
     )?;
-    create_memory_node(&mut fdt, guest_mem)?;
+    create_memory_node(&mut fdt, guest_mem, numa_nodes)?;
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_aia_node(&mut fdt, aia_device)?;
     create_devices_node(&mut fdt, device_info)?;
-    create_pci_nodes(&mut fdt, pci_space_info)?;
+    create_pci_nodes(&mut fdt, pci_space_info, numa_nodes)?;
+    if numa_nodes.len() > 1 {
+        create_distance_map_node(&mut fdt, numa_nodes)?;
+    }
 
     // End Header node.
     fdt.end_node(root_node)?;
@@ -126,6 +131,7 @@ fn create_cpu_nodes(
     isa_string: &str,
     isa_extensions: &[String],
     vcpu_topology: Option<(u16, u16, u16, u16)>,
+    numa_nodes: &NumaNodes,
     timebase_frequency: u32,
 ) -> FdtWriterResult<()> {
     // See https://elixir.bootlin.com/linux/v6.10/source/Documentation/devicetree/bindings/riscv/cpus.yaml
@@ -147,6 +153,12 @@ fn create_cpu_nodes(
         fdt.property_string("status", "okay")?;
         fdt.property_u32("reg", cpu_index)?;
         fdt.property_u32("phandle", CPU_BASE_PHANDLE + cpu_index)?;
+        if numa_nodes.len() > 1
+            && let Some(numa_node_id) =
+                numa_node_id(numa_nodes, |node| node.cpus.contains(&cpu_index))
+        {
+            fdt.property_u32("numa-node-id", numa_node_id)?;
+        }
 
         // interrupt controller node
         let intc_node = fdt.begin_node("interrupt-controller")?;
@@ -215,7 +227,56 @@ fn create_cpu_map_node(
     Ok(())
 }
 
-fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> FdtWriterResult<()> {
+// See Documentation/devicetree/bindings/numa.txt in the kernel.
+fn numa_node_id(numa_nodes: &NumaNodes, f: impl Fn(&NumaNode) -> bool) -> Option<u32> {
+    numa_nodes
+        .iter()
+        .find(|(_, node)| f(node))
+        .map(|(numa_node_id, _)| *numa_node_id)
+}
+
+fn create_memory_node(
+    fdt: &mut FdtWriter,
+    guest_mem: &GuestMemoryMmap,
+    numa_nodes: &NumaNodes,
+) -> FdtWriterResult<()> {
+    if numa_nodes.len() > 1 {
+        // Each NUMA node gets its own memory node, describing its memory zones.
+        for (numa_node_id, numa_node) in numa_nodes {
+            let mut mem_reg_property = Vec::new();
+            for region in numa_node.memory_regions.iter() {
+                mem_reg_property.push(region.start_addr().raw_value());
+                mem_reg_property.push(region.len());
+            }
+            if let Some(&node_start) = mem_reg_property.first() {
+                let memory_node = fdt.begin_node(&format!("memory@{node_start:x}"))?;
+                fdt.property_string("device_type", "memory")?;
+                fdt.property_array_u64("reg", &mem_reg_property)?;
+                fdt.property_u32("numa-node-id", *numa_node_id)?;
+                fdt.end_node(memory_node)?;
+            }
+        }
+
+        // Don't hide RAM from memory zones that are not part of any NUMA node.
+        for region in guest_mem.iter().filter(|region| {
+            numa_node_id(numa_nodes, |node| {
+                node.memory_regions
+                    .iter()
+                    .any(|r| r.start_addr() == region.start_addr())
+            })
+            .is_none()
+        }) {
+            let start = region.start_addr().raw_value();
+            warn!("Memory region at {start:#x} is not part of any NUMA node");
+            let memory_node = fdt.begin_node(&format!("memory@{start:x}"))?;
+            fdt.property_string("device_type", "memory")?;
+            fdt.property_array_u64("reg", &[start, region.len()])?;
+            fdt.end_node(memory_node)?;
+        }
+
+        return Ok(());
+    }
+
     // Note: memory regions from "GuestMemoryBackend" are sorted and non-zero sized.
     let ram_regions = {
         let mut ram_regions = Vec::new();
@@ -370,7 +431,11 @@ fn create_devices_node<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Buil
     Ok(())
 }
 
-fn create_pci_nodes(fdt: &mut FdtWriter, pci_device_info: &[PciSpaceInfo]) -> FdtWriterResult<()> {
+fn create_pci_nodes(
+    fdt: &mut FdtWriter,
+    pci_device_info: &[PciSpaceInfo],
+    numa_nodes: &NumaNodes,
+) -> FdtWriterResult<()> {
     // Add node for PCIe controller.
     // See Documentation/devicetree/bindings/pci/host-generic-pci.txt in the kernel
     // and https://elinux.org/Device_Tree_Usage.
@@ -467,6 +532,14 @@ fn create_pci_nodes(fdt: &mut FdtWriter, pci_device_info: &[PciSpaceInfo]) -> Fd
         fdt.property_null("dma-coherent")?;
         fdt.property_array_u32("msi-map", &msi_map)?;
         fdt.property_u32("msi-parent", AIA_IMSIC_PHANDLE)?;
+        if numa_nodes.len() > 1
+            && let Some(numa_node_id) = numa_node_id(numa_nodes, |node| {
+                node.pci_segments
+                    .contains(&pci_device_info_elem.pci_segment_id)
+            })
+        {
+            fdt.property_u32("numa-node-id", numa_node_id)?;
+        }
 
         fdt.end_node(pci_node)?;
     }
@@ -551,9 +624,42 @@ fn print_node(node: fdt_parser::node::FdtNode<'_, '_>, n_spaces: usize) {
     }
 }
 
+// See Documentation/devicetree/bindings/numa.txt in the kernel.
+fn create_distance_map_node(fdt: &mut FdtWriter, numa_nodes: &NumaNodes) -> FdtWriterResult<()> {
+    let distance_map_node = fdt.begin_node("distance-map")?;
+    fdt.property_string("compatible", "numa-distance-map-v1")?;
+    // Entries are <from to distance>, in ascending order of nodes. The local
+    // distance is 10, and remote ones default to 20 unless configured. The
+    // distance is the same in both directions unless both are configured.
+    let mut distance_matrix = Vec::new();
+    for (numa_node_id, numa_node) in numa_nodes {
+        for (dest_numa_node_id, dest_numa_node) in numa_nodes {
+            let distance = if numa_node_id == dest_numa_node_id {
+                10
+            } else {
+                numa_node
+                    .distances
+                    .get(dest_numa_node_id)
+                    .or_else(|| dest_numa_node.distances.get(numa_node_id))
+                    .map_or(20, |&distance| u32::from(distance))
+            };
+            distance_matrix.extend([*numa_node_id, *dest_numa_node_id, distance]);
+        }
+    }
+    fdt.property_array_u32("distance-matrix", &distance_matrix)?;
+    fdt.end_node(distance_map_node)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use vm_memory::GuestAddress;
+
     use super::*;
+    use crate::GuestRegionMmap;
 
     fn cpus_dtb(num_cpus: u32, vcpu_topology: Option<(u16, u16, u16, u16)>) -> Vec<u8> {
         let isa_extensions: Vec<String> = ["i", "m", "a", "zicbom"]
@@ -568,6 +674,7 @@ mod tests {
             "rv64ima_zicbom",
             &isa_extensions,
             vcpu_topology,
+            &NumaNodes::new(),
             10_000_000,
         )
         .unwrap();
@@ -637,5 +744,94 @@ mod tests {
         let dtb = cpus_dtb(4, None);
         let fdt = fdt_parser::Fdt::new(&dtb).unwrap();
         assert!(fdt.find_node("/cpus/cpu-map").is_none());
+    }
+
+    fn ram_region(start: u64, size: usize) -> Arc<GuestRegionMmap> {
+        Arc::new(GuestRegionMmap::from_range(GuestAddress(start), size, None).unwrap())
+    }
+
+    fn numa_dtb() -> Vec<u8> {
+        const MIB: usize = 1 << 20;
+        let regions = [
+            ram_region(0x4000_0000, 16 * MIB),
+            ram_region(0x4100_0000, 16 * MIB),
+            ram_region(0x4200_0000, 16 * MIB),
+        ];
+        let guest_mem = GuestMemoryMmap::from_arc_regions(regions.to_vec()).unwrap();
+
+        let mut numa_nodes = NumaNodes::new();
+        numa_nodes.insert(
+            0,
+            NumaNode {
+                memory_regions: vec![Arc::clone(&regions[0])],
+                cpus: vec![0, 1],
+                pci_segments: vec![0],
+                distances: BTreeMap::from([(1, 15)]),
+                ..Default::default()
+            },
+        );
+        // The third memory region is not part of any NUMA node.
+        numa_nodes.insert(
+            1,
+            NumaNode {
+                memory_regions: vec![Arc::clone(&regions[1])],
+                cpus: vec![2, 3],
+                pci_segments: vec![1],
+                ..Default::default()
+            },
+        );
+
+        let pci_space_info: Vec<PciSpaceInfo> = (0..2)
+            .map(|id| PciSpaceInfo {
+                pci_segment_id: id,
+                mmio_config_address: 0x3000_0000 + u64::from(id) * PCI_MMIO_CONFIG_SIZE_PER_SEGMENT,
+                pci_device_space_start: 0x2_0000_0000 + u64::from(id) * 0x1_0000_0000,
+                pci_device_space_size: 0x1_0000_0000,
+            })
+            .collect();
+
+        let mut fdt = FdtWriter::new().unwrap();
+        let root = fdt.begin_node("").unwrap();
+        fdt.property_u32("#address-cells", ADDRESS_CELLS).unwrap();
+        fdt.property_u32("#size-cells", SIZE_CELLS).unwrap();
+        create_cpu_nodes(&mut fdt, 4, "rv64ima", &[], None, &numa_nodes, 10_000_000).unwrap();
+        create_memory_node(&mut fdt, &guest_mem, &numa_nodes).unwrap();
+        create_pci_nodes(&mut fdt, &pci_space_info, &numa_nodes).unwrap();
+        create_distance_map_node(&mut fdt, &numa_nodes).unwrap();
+        fdt.end_node(root).unwrap();
+        fdt.finish().unwrap()
+    }
+
+    #[test]
+    fn test_numa_nodes() {
+        let dtb = numa_dtb();
+        let fdt = fdt_parser::Fdt::new(&dtb).unwrap();
+        let numa_node_id = |path: &str| {
+            fdt.find_node(path)
+                .unwrap()
+                .property("numa-node-id")
+                .map(|p| p.as_usize().unwrap())
+        };
+
+        assert_eq!(numa_node_id("/cpus/cpu@1"), Some(0));
+        assert_eq!(numa_node_id("/cpus/cpu@2"), Some(1));
+        assert_eq!(numa_node_id("/memory@40000000"), Some(0));
+        assert_eq!(numa_node_id("/memory@41000000"), Some(1));
+        // RAM outside of the NUMA nodes is still described.
+        assert_eq!(numa_node_id("/memory@42000000"), None);
+        assert_eq!(numa_node_id("/pci@30000000"), Some(0));
+        assert_eq!(numa_node_id("/pci@30100000"), Some(1));
+
+        let distance_matrix: Vec<u32> = fdt
+            .find_node("/distance-map")
+            .unwrap()
+            .property("distance-matrix")
+            .unwrap()
+            .value
+            .chunks(4)
+            .map(BigEndian::read_u32)
+            .collect();
+        // The 0 -> 1 distance applies to 1 -> 0 too.
+        assert_eq!(distance_matrix, [0, 0, 10, 0, 1, 15, 1, 0, 15, 1, 1, 10]);
     }
 }

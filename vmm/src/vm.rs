@@ -504,7 +504,6 @@ pub struct Vm {
     // The hypervisor abstracted virtual machine.
     vm: Arc<dyn hypervisor::Vm>,
     saved_clock: Option<SavedClock>,
-    #[cfg(not(target_arch = "riscv64"))]
     numa_nodes: NumaNodes,
     stop_on_boot: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
@@ -674,7 +673,6 @@ impl Vm {
             memory_manager,
             vm,
             saved_clock,
-            #[cfg(not(target_arch = "riscv64"))]
             numa_nodes,
             stop_on_boot,
             load_payload_handle,
@@ -1961,6 +1959,7 @@ impl Vm {
             timebase_frequency,
             &isa_extensions,
             vcpu_topology,
+            &self.numa_nodes,
         )
         .map_err(Error::ConfigureSystem)?;
 
