@@ -28,6 +28,9 @@ pub struct KvmAiaImsics {
 
     /// Number of IMSIC interrupt identities configured by KVM
     imsic_num_ids: u32,
+
+    /// Number of APLIC wired interrupt sources configured in KVM
+    aplic_num_sources: u32,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -82,6 +85,7 @@ impl KvmAiaImsics {
             &raw const safe_nr_irqs as u64,
             0,
         )?;
+        self.aplic_num_sources = safe_nr_irqs;
 
         // Setting up hart_bits
         let max_hart_index = self.vcpu_count as u64 - 1;
@@ -226,6 +230,7 @@ impl KvmAiaImsics {
             aplic_addr: config.aplic_addr,
             imsic_addr: config.imsic_addr,
             imsic_num_ids: 0,
+            aplic_num_sources: 0,
         };
 
         aia_device.init_device_attributes(config.nr_irqs)?;
@@ -265,6 +270,10 @@ impl Vaia for KvmAiaImsics {
         self.imsic_num_ids
     }
 
+    fn aplic_num_sources(&self) -> u32 {
+        self.aplic_num_sources
+    }
+
     fn vcpu_count(&self) -> u32 {
         self.vcpu_count
     }
@@ -287,7 +296,7 @@ impl Vaia for KvmAiaImsics {
 #[cfg(test)]
 mod tests {
     use crate::HypervisorVmConfig;
-    use crate::arch::riscv64::aia::VaiaConfig;
+    use crate::arch::riscv64::aia::{Vaia, VaiaConfig};
     use crate::kvm::KvmAiaImsics;
 
     fn create_test_vaia_config() -> VaiaConfig {
@@ -307,5 +316,21 @@ mod tests {
 
         let vaia_config = create_test_vaia_config();
         assert!(KvmAiaImsics::new(&*vm, &vaia_config).is_ok());
+    }
+
+    #[test]
+    fn test_aplic_num_sources() {
+        let hv = crate::new().unwrap();
+        let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
+        let _vcpu = vm.create_vcpu(0, None).unwrap();
+
+        // More sources than any host supports: clamped to what KVM accepts.
+        let vaia_config = VaiaConfig {
+            nr_irqs: 1023,
+            ..create_test_vaia_config()
+        };
+        let aia = KvmAiaImsics::new(&*vm, &vaia_config).unwrap();
+        assert!(aia.aplic_num_sources() > 0);
+        assert!(aia.aplic_num_sources() <= aia.imsic_num_ids());
     }
 }

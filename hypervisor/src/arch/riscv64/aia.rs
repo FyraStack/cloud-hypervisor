@@ -60,6 +60,9 @@ pub trait Vaia: Send + Sync {
     /// Returns the number of IMSIC interrupt identities exposed to the guest
     fn imsic_num_ids(&self) -> u32;
 
+    /// Returns the number of APLIC wired interrupt sources exposed to the guest
+    fn aplic_num_sources(&self) -> u32;
+
     /// Returns the number of vCPUs this AIA handles
     fn vcpu_count(&self) -> u32;
 
