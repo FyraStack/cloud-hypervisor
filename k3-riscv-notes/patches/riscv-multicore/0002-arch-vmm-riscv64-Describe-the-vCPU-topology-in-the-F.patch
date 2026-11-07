@@ -1,0 +1,262 @@
+From 039edfed6e0037835cf34e30df41e22732644a05 Mon Sep 17 00:00:00 2001
+From: Caleb Jones <caleb@calebgj.io>
+Date: Wed, 28 Oct 2026 22:20:41 +0000
+Subject: [PATCH 2/8] arch, vmm: riscv64: Describe the vCPU topology in the FDT
+
+--cpus topology=... was ignored on riscv64: the FDT only listed the
+harts, so the guest saw every vCPU as its own core with no cluster or
+socket grouping.
+
+Emit a cpu-map node (socket/cluster/core/thread) the same way aarch64
+does. Dies are described as clusters, so a guest can mirror hosts that
+group cores in several clusters per socket, e.g. topology=1:4:2:1 for
+two clusters of four cores. The map is only emitted when the topology
+covers exactly the booted harts, since there is no CPU hotplug on
+riscv64 and the map must not reference missing CPU nodes.
+
+Also add FDT unit tests for the cpu-map and the ISA properties.
+
+Signed-off-by: Caleb Jones <caleb@calebgj.io>
+---
+ arch/src/riscv64/fdt.rs | 145 +++++++++++++++++++++++++++++++++++++++-
+ arch/src/riscv64/mod.rs |   2 +
+ vmm/src/vm.rs           |   3 +
+ 3 files changed, 149 insertions(+), 1 deletion(-)
+
+diff --git a/arch/src/riscv64/fdt.rs b/arch/src/riscv64/fdt.rs
+index 541f18431..e10744cbb 100644
+--- a/arch/src/riscv64/fdt.rs
++++ b/arch/src/riscv64/fdt.rs
+@@ -15,7 +15,7 @@
+ 
+ use byteorder::{BigEndian, ByteOrder};
+ use hypervisor::arch::riscv64::aia::Vaia;
+-use log::debug;
++use log::{debug, warn};
+ use thiserror::Error;
+ use vm_fdt::{FdtWriter, FdtWriterResult};
+ use vm_memory::{Address, Bytes, GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
+@@ -68,6 +68,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
+     num_vcpu: u32,
+     isa_string: &str,
+     isa_extensions: &[String],
++    vcpu_topology: Option<(u16, u16, u16, u16)>,
+     device_info: &HashMap<(DeviceType, String), T, S>,
+     aia_device: &Arc<Mutex<dyn Vaia>>,
+     initrd: &Option<InitramfsConfig>,
+@@ -93,6 +94,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
+         num_vcpu,
+         isa_string,
+         isa_extensions,
++        vcpu_topology,
+         timebase_frequency,
+     )?;
+     create_memory_node(&mut fdt, guest_mem)?;
+@@ -123,6 +125,7 @@ fn create_cpu_nodes(
+     num_cpus: u32,
+     isa_string: &str,
+     isa_extensions: &[String],
++    vcpu_topology: Option<(u16, u16, u16, u16)>,
+     timebase_frequency: u32,
+ ) -> FdtWriterResult<()> {
+     // See https://elixir.bootlin.com/linux/v6.10/source/Documentation/devicetree/bindings/riscv/cpus.yaml
+@@ -156,11 +159,62 @@ fn create_cpu_nodes(
+         fdt.end_node(cpu)?;
+     }
+ 
++    if let Some(topology) = vcpu_topology {
++        create_cpu_map_node(fdt, num_cpus, topology)?;
++    } else {
++        debug!("Boot using device tree, CPU topology is not (correctly) specified");
++    }
++
+     fdt.end_node(cpus)?;
+ 
+     Ok(())
+ }
+ 
++// See https://www.kernel.org/doc/Documentation/devicetree/bindings/cpu/cpu-topology.txt
++// Each die is described as a cluster, so the guest sees the same core grouping as
++// e.g. a host with several clusters per socket.
++fn create_cpu_map_node(
++    fdt: &mut FdtWriter,
++    num_cpus: u32,
++    (threads_per_core, cores_per_die, dies_per_package, packages): (u16, u16, u16, u16),
++) -> FdtWriterResult<()> {
++    let topology_cpus = u32::from(threads_per_core)
++        * u32::from(cores_per_die)
++        * u32::from(dies_per_package)
++        * u32::from(packages);
++    // The map must only reference existing harts (riscv64 has no CPU hotplug).
++    if topology_cpus != num_cpus {
++        warn!(
++            "CPU topology covers {topology_cpus} vCPUs but {num_cpus} are booted, skipping cpu-map"
++        );
++        return Ok(());
++    }
++
++    let cpu_map_node = fdt.begin_node("cpu-map")?;
++    let mut cpu_idx = 0;
++    for package_idx in 0..packages {
++        let package_node = fdt.begin_node(&format!("socket{package_idx:x}"))?;
++        for die_idx in 0..dies_per_package {
++            let cluster_node = fdt.begin_node(&format!("cluster{die_idx:x}"))?;
++            for core_idx in 0..cores_per_die {
++                let core_node = fdt.begin_node(&format!("core{core_idx:x}"))?;
++                for thread_idx in 0..threads_per_core {
++                    let thread_node = fdt.begin_node(&format!("thread{thread_idx:x}"))?;
++                    fdt.property_u32("cpu", CPU_BASE_PHANDLE + cpu_idx)?;
++                    fdt.end_node(thread_node)?;
++                    cpu_idx += 1;
++                }
++                fdt.end_node(core_node)?;
++            }
++            fdt.end_node(cluster_node)?;
++        }
++        fdt.end_node(package_node)?;
++    }
++    fdt.end_node(cpu_map_node)?;
++
++    Ok(())
++}
++
+ fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> FdtWriterResult<()> {
+     // Note: memory regions from "GuestMemoryBackend" are sorted and non-zero sized.
+     let ram_regions = {
+@@ -496,3 +550,92 @@ fn print_node(node: fdt_parser::node::FdtNode<'_, '_>, n_spaces: usize) {
+         print_node(child, n_spaces + 2);
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn cpus_dtb(num_cpus: u32, vcpu_topology: Option<(u16, u16, u16, u16)>) -> Vec<u8> {
++        let isa_extensions: Vec<String> = ["i", "m", "a", "zicbom"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        let mut fdt = FdtWriter::new().unwrap();
++        let root = fdt.begin_node("").unwrap();
++        create_cpu_nodes(
++            &mut fdt,
++            num_cpus,
++            "rv64ima_zicbom",
++            &isa_extensions,
++            vcpu_topology,
++            10_000_000,
++        )
++        .unwrap();
++        fdt.end_node(root).unwrap();
++        fdt.finish().unwrap()
++    }
++
++    #[test]
++    fn test_cpu_isa_properties() {
++        let dtb = cpus_dtb(1, None);
++        let fdt = fdt_parser::Fdt::new(&dtb).unwrap();
++        let cpu = fdt.find_node("/cpus/cpu@0").unwrap();
++
++        let isa = cpu.property("riscv,isa").unwrap().as_str().unwrap();
++        assert_eq!(isa, "rv64ima_zicbom");
++        let isa_base = cpu.property("riscv,isa-base").unwrap().as_str().unwrap();
++        assert_eq!(isa_base, "rv64i");
++        let isa_extensions: Vec<&str> =
++            str::from_utf8(cpu.property("riscv,isa-extensions").unwrap().value)
++                .unwrap()
++                .trim_end_matches('\0')
++                .split('\0')
++                .collect();
++        assert_eq!(isa_extensions, ["i", "m", "a", "zicbom"]);
++    }
++
++    #[test]
++    fn test_cpu_map() {
++        // 2 sockets x 2 clusters (dies) x 2 cores x 2 threads
++        let dtb = cpus_dtb(16, Some((2, 2, 2, 2)));
++        let fdt = fdt_parser::Fdt::new(&dtb).unwrap();
++
++        let cpu_of = |path: &str| {
++            fdt.find_node(path)
++                .unwrap()
++                .property("cpu")
++                .unwrap()
++                .as_usize()
++                .unwrap() as u32
++        };
++        assert_eq!(
++            cpu_of("/cpus/cpu-map/socket0/cluster0/core0/thread0"),
++            CPU_BASE_PHANDLE
++        );
++        assert_eq!(
++            cpu_of("/cpus/cpu-map/socket0/cluster1/core0/thread1"),
++            CPU_BASE_PHANDLE + 5
++        );
++        assert_eq!(
++            cpu_of("/cpus/cpu-map/socket1/cluster1/core1/thread1"),
++            CPU_BASE_PHANDLE + 15
++        );
++        let cpu15 = fdt.find_node("/cpus/cpu@f").unwrap();
++        assert_eq!(
++            cpu15.property("phandle").unwrap().as_usize().unwrap() as u32,
++            CPU_BASE_PHANDLE + 15
++        );
++    }
++
++    #[test]
++    fn test_cpu_map_skipped_on_mismatch() {
++        // A topology that doesn't cover exactly the booted harts must not be described.
++        let dtb = cpus_dtb(4, Some((1, 4, 1, 2)));
++        let fdt = fdt_parser::Fdt::new(&dtb).unwrap();
++        assert!(fdt.find_node("/cpus/cpu-map").is_none());
++
++        let dtb = cpus_dtb(4, None);
++        let fdt = fdt_parser::Fdt::new(&dtb).unwrap();
++        assert!(fdt.find_node("/cpus/cpu-map").is_none());
++    }
++}
+diff --git a/arch/src/riscv64/mod.rs b/arch/src/riscv64/mod.rs
+index 3002f98f2..5a6c34ccb 100644
+--- a/arch/src/riscv64/mod.rs
++++ b/arch/src/riscv64/mod.rs
+@@ -188,6 +188,7 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
+     aia_device: &Arc<Mutex<dyn Vaia>>,
+     timebase_frequency: u32,
+     isa_extensions: &[String],
++    vcpu_topology: Option<(u16, u16, u16, u16)>,
+ ) -> super::Result<()> {
+     let isa_extensions = if isa_extensions.is_empty() {
+         isa_extensions_from_host()?
+@@ -201,6 +202,7 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
+         num_vcpu,
+         &isa_string,
+         &isa_extensions,
++        vcpu_topology,
+         device_info,
+         aia_device,
+         initrd,
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index 4c0d59f84..9dc5b37fa 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -1948,6 +1948,8 @@ fn configure_system(&mut self) -> Result<()> {
+             .and_then(|vcpu| vcpu.lock().unwrap().get_isa_extensions().ok())
+             .unwrap_or_default();
+ 
++        let vcpu_topology = self.cpu_manager.lock().unwrap().get_vcpu_topology();
++
+         arch::configure_system(
+             &mem,
+             cmdline.as_cstring().unwrap().to_str().unwrap(),
+@@ -1958,6 +1960,7 @@ fn configure_system(&mut self) -> Result<()> {
+             &vaia,
+             timebase_frequency,
+             &isa_extensions,
++            vcpu_topology,
+         )
+         .map_err(Error::ConfigureSystem)?;
+ 
+-- 
+2.56.0
+

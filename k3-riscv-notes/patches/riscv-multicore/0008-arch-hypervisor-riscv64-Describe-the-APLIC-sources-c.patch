@@ -1,0 +1,130 @@
+From 7ae077c049d6509ec9541211176d3a67d59e91a0 Mon Sep 17 00:00:00 2001
+From: Caleb Jones <caleb@calebgj.io>
+Date: Wed, 28 Oct 2026 23:27:46 +0000
+Subject: [PATCH 8/8] arch, hypervisor: riscv64: Describe the APLIC sources
+ configured in KVM
+
+The FDT always described 96 APLIC interrupt sources, whatever was
+configured in KVM. KVM clamps the requested number of sources (1023) to
+the number of guest MSI identities, which depends on the host, e.g. 255
+with QEMU's virt machine and 63 on the SpacemiT K3. The guest was thus
+told about sources that don't exist on hosts with fewer than 96, and
+couldn't use the others.
+
+Expose the number of sources configured in the hypervisor through the
+Vaia trait and use it for "riscv,num-sources".
+
+Signed-off-by: Caleb Jones <caleb@calebgj.io>
+---
+ arch/src/riscv64/fdt.rs            |  8 ++++++--
+ hypervisor/src/arch/riscv64/aia.rs |  3 +++
+ hypervisor/src/kvm/riscv64/aia.rs  | 27 ++++++++++++++++++++++++++-
+ 3 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/arch/src/riscv64/fdt.rs b/arch/src/riscv64/fdt.rs
+index caa0dded1..6e5991fb2 100644
+--- a/arch/src/riscv64/fdt.rs
++++ b/arch/src/riscv64/fdt.rs
+@@ -389,8 +389,12 @@ fn create_aia_node(fdt: &mut FdtWriter, aia_device: &Arc<Mutex<dyn Vaia>>) -> Fd
+     fdt.property_array_u32("reg", &reg_cells)?;
+     fdt.property_u32("#interrupt-cells", 2u32)?;
+     fdt.property_null("interrupt-controller")?;
+-    // TODO complete num-srcs
+-    fdt.property_u32("riscv,num-sources", 96u32)?;
++    // Must match the sources configured in the hypervisor, which may be
++    // limited by the host.
++    fdt.property_u32(
++        "riscv,num-sources",
++        aia_device.lock().unwrap().aplic_num_sources(),
++    )?;
+     fdt.property_u32("phandle", AIA_APLIC_PHANDLE)?;
+     fdt.property_u32("msi-parent", AIA_IMSIC_PHANDLE)?;
+ 
+diff --git a/hypervisor/src/arch/riscv64/aia.rs b/hypervisor/src/arch/riscv64/aia.rs
+index b544603ab..29906837f 100644
+--- a/hypervisor/src/arch/riscv64/aia.rs
++++ b/hypervisor/src/arch/riscv64/aia.rs
+@@ -60,6 +60,9 @@ pub trait Vaia: Send + Sync {
+     /// Returns the number of IMSIC interrupt identities exposed to the guest
+     fn imsic_num_ids(&self) -> u32;
+ 
++    /// Returns the number of APLIC wired interrupt sources exposed to the guest
++    fn aplic_num_sources(&self) -> u32;
++
+     /// Returns the number of vCPUs this AIA handles
+     fn vcpu_count(&self) -> u32;
+ 
+diff --git a/hypervisor/src/kvm/riscv64/aia.rs b/hypervisor/src/kvm/riscv64/aia.rs
+index 2bf576bc5..216838aea 100644
+--- a/hypervisor/src/kvm/riscv64/aia.rs
++++ b/hypervisor/src/kvm/riscv64/aia.rs
+@@ -28,6 +28,9 @@ pub struct KvmAiaImsics {
+ 
+     /// Number of IMSIC interrupt identities configured by KVM
+     imsic_num_ids: u32,
++
++    /// Number of APLIC wired interrupt sources configured in KVM
++    aplic_num_sources: u32,
+ }
+ 
+ #[derive(Clone, Default, Serialize, Deserialize)]
+@@ -82,6 +85,7 @@ fn init_device_attributes(&mut self, nr_irqs: u32) -> Result<()> {
+             &raw const safe_nr_irqs as u64,
+             0,
+         )?;
++        self.aplic_num_sources = safe_nr_irqs;
+ 
+         // Setting up hart_bits
+         let max_hart_index = self.vcpu_count as u64 - 1;
+@@ -226,6 +230,7 @@ pub fn new(vm: &dyn Vm, config: &VaiaConfig) -> Result<KvmAiaImsics> {
+             aplic_addr: config.aplic_addr,
+             imsic_addr: config.imsic_addr,
+             imsic_num_ids: 0,
++            aplic_num_sources: 0,
+         };
+ 
+         aia_device.init_device_attributes(config.nr_irqs)?;
+@@ -265,6 +270,10 @@ fn imsic_num_ids(&self) -> u32 {
+         self.imsic_num_ids
+     }
+ 
++    fn aplic_num_sources(&self) -> u32 {
++        self.aplic_num_sources
++    }
++
+     fn vcpu_count(&self) -> u32 {
+         self.vcpu_count
+     }
+@@ -287,7 +296,7 @@ fn set_state(&mut self, _state: &AiaImsicsState) -> Result<()> {
+ #[cfg(test)]
+ mod tests {
+     use crate::HypervisorVmConfig;
+-    use crate::arch::riscv64::aia::VaiaConfig;
++    use crate::arch::riscv64::aia::{Vaia, VaiaConfig};
+     use crate::kvm::KvmAiaImsics;
+ 
+     fn create_test_vaia_config() -> VaiaConfig {
+@@ -308,4 +317,20 @@ fn test_create_aia() {
+         let vaia_config = create_test_vaia_config();
+         assert!(KvmAiaImsics::new(&*vm, &vaia_config).is_ok());
+     }
++
++    #[test]
++    fn test_aplic_num_sources() {
++        let hv = crate::new().unwrap();
++        let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
++        let _vcpu = vm.create_vcpu(0, None).unwrap();
++
++        // More sources than any host supports: clamped to what KVM accepts.
++        let vaia_config = VaiaConfig {
++            nr_irqs: 1023,
++            ..create_test_vaia_config()
++        };
++        let aia = KvmAiaImsics::new(&*vm, &vaia_config).unwrap();
++        assert!(aia.aplic_num_sources() > 0);
++        assert!(aia.aplic_num_sources() <= aia.imsic_num_ids());
++    }
+ }
+-- 
+2.56.0
+

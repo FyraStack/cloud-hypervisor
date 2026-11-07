@@ -1,0 +1,452 @@
+From 269feaa4f6b8b3b66c597a0b9e27d938be6cc2f2 Mon Sep 17 00:00:00 2001
+From: Caleb Jones <caleb@calebgj.io>
+Date: Wed, 28 Oct 2026 22:17:08 +0000
+Subject: [PATCH 1/8] arch, hypervisor, vmm: riscv64: Describe guest ISA from
+ KVM in the FDT
+
+The riscv64 CPU nodes only carried the deprecated "riscv,isa" string,
+built from the host's /proc/cpuinfo. Two problems with that:
+
+- Kernels built with CONFIG_RISCV_ISA_FALLBACK=n (e.g. Ubuntu 26.04)
+  no longer parse "riscv,isa" and reject every hart:
+  "CPU with hartid=0 is invalid: this kernel does not parse riscv,isa",
+  followed by a BUG in of_parse_and_init_cpus().
+- The host ISA is not the guest ISA. KVM may not expose every host
+  extension to the guest (vendor or newer extensions), and the guest
+  would then use instructions or CSRs that trap.
+
+Query the extensions enabled for the vCPU from the KVM ISA_EXT one-reg
+interface and emit "riscv,isa-base" and "riscv,isa-extensions", keeping
+a matching "riscv,isa" string for older kernels. Fall back to the host
+ISA when the hypervisor can't report it.
+
+Signed-off-by: Caleb Jones <caleb@calebgj.io>
+---
+ arch/src/riscv64/fdt.rs           | 13 +++-
+ arch/src/riscv64/mod.rs           | 89 ++++++++++++++++++++-------
+ hypervisor/src/cpu.rs             |  6 ++
+ hypervisor/src/kvm/mod.rs         | 38 ++++++++++++
+ hypervisor/src/kvm/riscv64/mod.rs | 99 ++++++++++++++++++++++++++++++-
+ vmm/src/cpu.rs                    |  7 +++
+ vmm/src/vm.rs                     | 11 ++++
+ 7 files changed, 239 insertions(+), 24 deletions(-)
+
+diff --git a/arch/src/riscv64/fdt.rs b/arch/src/riscv64/fdt.rs
+index 9290e2a97..541f18431 100644
+--- a/arch/src/riscv64/fdt.rs
++++ b/arch/src/riscv64/fdt.rs
+@@ -67,6 +67,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
+     cmdline: &str,
+     num_vcpu: u32,
+     isa_string: &str,
++    isa_extensions: &[String],
+     device_info: &HashMap<(DeviceType, String), T, S>,
+     aia_device: &Arc<Mutex<dyn Vaia>>,
+     initrd: &Option<InitramfsConfig>,
+@@ -87,7 +88,13 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
+     // Properties
+     fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
+     fdt.property_u32("#size-cells", SIZE_CELLS)?;
+-    create_cpu_nodes(&mut fdt, num_vcpu, isa_string, timebase_frequency)?;
++    create_cpu_nodes(
++        &mut fdt,
++        num_vcpu,
++        isa_string,
++        isa_extensions,
++        timebase_frequency,
++    )?;
+     create_memory_node(&mut fdt, guest_mem)?;
+     create_chosen_node(&mut fdt, cmdline, initrd)?;
+     create_aia_node(&mut fdt, aia_device)?;
+@@ -115,6 +122,7 @@ fn create_cpu_nodes(
+     fdt: &mut FdtWriter,
+     num_cpus: u32,
+     isa_string: &str,
++    isa_extensions: &[String],
+     timebase_frequency: u32,
+ ) -> FdtWriterResult<()> {
+     // See https://elixir.bootlin.com/linux/v6.10/source/Documentation/devicetree/bindings/riscv/cpus.yaml
+@@ -129,7 +137,10 @@ fn create_cpu_nodes(
+         fdt.property_string("device_type", "cpu")?;
+         fdt.property_string("compatible", "riscv")?;
+         fdt.property_string("mmu-type", "sv48")?;
++        // "riscv,isa" is deprecated, but older kernels only parse it.
+         fdt.property_string("riscv,isa", isa_string)?;
++        fdt.property_string("riscv,isa-base", "rv64i")?;
++        fdt.property_string_list("riscv,isa-extensions", isa_extensions.to_vec())?;
+         fdt.property_string("status", "okay")?;
+         fdt.property_u32("reg", cpu_index)?;
+         fdt.property_u32("phandle", CPU_BASE_PHANDLE + cpu_index)?;
+diff --git a/arch/src/riscv64/mod.rs b/arch/src/riscv64/mod.rs
+index db5e13b37..3002f98f2 100644
+--- a/arch/src/riscv64/mod.rs
++++ b/arch/src/riscv64/mod.rs
+@@ -122,9 +122,9 @@ pub fn arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
+     ]
+ }
+ 
+-// Read the first "isa" string from /proc/cpuinfo and filter out the H extension,
+-// while correctly preserving multi-letter extensions.
+-fn isa_string_from_host() -> Result<String, Error> {
++// Read the first "isa" string from /proc/cpuinfo and split it into extension names,
++// filtering out the H extension. Used when the hypervisor cannot report the guest ISA.
++fn isa_extensions_from_host() -> Result<Vec<String>, Error> {
+     let file = File::open("/proc/cpuinfo").map_err(Error::OpenCpuInfo)?;
+     let reader = BufReader::new(file);
+ 
+@@ -135,23 +135,7 @@ fn isa_string_from_host() -> Result<String, Error> {
+         if trimmed_line.starts_with("isa") {
+             let parts: Vec<&str> = trimmed_line.split(':').collect();
+             if parts.len() == 2 {
+-                let isa_string = parts[1].trim();
+-
+-                // Split the string by underscores to separate single letter vs long-form
+-                // extensions
+-                let mut components: Vec<String> =
+-                    isa_string.split('_').map(|s| s.to_string()).collect();
+-
+-                if components.is_empty() {
+-                    return Err(Error::InvalidIsaString(isa_string.to_string()));
+-                }
+-
+-                // Remove H extension if present in single letter extensions
+-                let first_component = components[0].chars().filter(|&c| c != 'h').collect();
+-
+-                components[0] = first_component;
+-
+-                return Ok(components.join("_"));
++                return isa_extensions_from_isa_string(parts[1].trim());
+             }
+         }
+     }
+@@ -159,7 +143,41 @@ fn isa_string_from_host() -> Result<String, Error> {
+     Err(Error::CpuInfoParsing)
+ }
+ 
++// Split an ISA string such as "rv64imafdch_zicbom_zicboz" into extension names,
++// dropping the H extension.
++fn isa_extensions_from_isa_string(isa_string: &str) -> Result<Vec<String>, Error> {
++    let mut components = isa_string.split('_');
++    let single_letter = components
++        .next()
++        .and_then(|base| base.strip_prefix("rv64"))
++        .ok_or_else(|| Error::InvalidIsaString(isa_string.to_string()))?;
++
++    Ok(single_letter
++        .chars()
++        .filter(|&c| c != 'h')
++        .map(|c| c.to_string())
++        .chain(components.filter(|s| !s.is_empty()).map(str::to_string))
++        .collect())
++}
++
++// Build the legacy "riscv,isa" string from extension names: the single-letter
++// extensions in canonical order, then the multi-letter ones separated by '_'.
++fn isa_string_from_extensions(extensions: &[String]) -> String {
++    let mut isa_string = String::from("rv64");
++    for c in "imafdqlcbjtpvh".chars() {
++        if extensions.iter().any(|e| e.len() == 1 && e.starts_with(c)) {
++            isa_string.push(c);
++        }
++    }
++    for extension in extensions.iter().filter(|e| e.len() > 1) {
++        isa_string.push('_');
++        isa_string.push_str(extension);
++    }
++    isa_string
++}
++
+ /// Configures the system and should be called once per vm before starting vcpu threads.
++#[expect(clippy::too_many_arguments)]
+ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHasher>(
+     guest_mem: &GuestMemoryMmap,
+     cmdline: &str,
+@@ -169,13 +187,20 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
+     pci_space_info: &[PciSpaceInfo],
+     aia_device: &Arc<Mutex<dyn Vaia>>,
+     timebase_frequency: u32,
++    isa_extensions: &[String],
+ ) -> super::Result<()> {
+-    let isa_string = isa_string_from_host()?;
++    let isa_extensions = if isa_extensions.is_empty() {
++        isa_extensions_from_host()?
++    } else {
++        isa_extensions.to_vec()
++    };
++    let isa_string = isa_string_from_extensions(&isa_extensions);
+     let fdt_final = fdt::create_fdt(
+         guest_mem,
+         cmdline,
+         num_vcpu,
+         &isa_string,
++        &isa_extensions,
+         device_info,
+         aia_device,
+         initrd,
+@@ -229,4 +254,26 @@ fn test_arch_memory_regions_dram() {
+         assert_eq!(layout::RAM_START, regions[3].0);
+         assert_eq!(RegionType::Ram, regions[3].2);
+     }
++
++    #[test]
++    fn test_isa_extensions_from_isa_string() {
++        assert_eq!(
++            isa_extensions_from_isa_string("rv64imafdcvh_zicbom_zicboz").unwrap(),
++            ["i", "m", "a", "f", "d", "c", "v", "zicbom", "zicboz"]
++        );
++        isa_extensions_from_isa_string("rv32imac").unwrap_err();
++    }
++
++    #[test]
++    fn test_isa_string_from_extensions() {
++        // KVM reports extensions in enum order, not canonical order.
++        let extensions: Vec<String> = ["a", "c", "d", "f", "i", "m", "sstc", "v", "zicbom"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert_eq!(
++            isa_string_from_extensions(&extensions),
++            "rv64imafdcv_sstc_zicbom"
++        );
++    }
+ }
+diff --git a/hypervisor/src/cpu.rs b/hypervisor/src/cpu.rs
+index c947fe021..ae0789adf 100644
+--- a/hypervisor/src/cpu.rs
++++ b/hypervisor/src/cpu.rs
+@@ -337,6 +337,12 @@ fn vcpu_set_processor_features(
+     fn get_timebase_frequency(&self) -> Result<u64> {
+         Ok(0)
+     }
++    /// Get the ISA extensions exposed to the guest on RISC-V 64-bit, using the
++    /// devicetree `riscv,isa-extensions` names (e.g. "i", "m", "zicbom").
++    #[cfg(target_arch = "riscv64")]
++    fn get_isa_extensions(&self) -> Result<Vec<String>> {
++        Ok(Vec::new())
++    }
+     /// Configure core registers for a given CPU.
+     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+     fn setup_regs(
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index f28328b32..85224afae 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -2718,6 +2718,20 @@ fn set_cntvct(&self, val: u64) -> cpu::Result<()> {
+         Ok(())
+     }
+ 
++    #[cfg(target_arch = "riscv64")]
++    fn get_isa_extensions(&self) -> cpu::Result<Vec<String>> {
++        let mut extensions = Vec::new();
++        for (index, name) in riscv64::ISA_EXT_NAMES.iter().enumerate() {
++            let id = riscv64::isa_ext_reg_id(index as u64);
++            let mut bytes = [0u8; 8];
++            // Extensions unknown to the running kernel are rejected: skip them.
++            if self.fd.get_one_reg(id, &mut bytes).is_ok() && u64::from_le_bytes(bytes) != 0 {
++                extensions.push((*name).to_string());
++            }
++        }
++        Ok(extensions)
++    }
++
+     #[cfg(target_arch = "riscv64")]
+     fn get_timebase_frequency(&self) -> cpu::Result<u64> {
+         use kvm_bindings::kvm_riscv_timer;
+@@ -3755,6 +3769,30 @@ fn test_validate_gpa_range() {
+         vcpu.validate_gpa_range(0x1000, 1).unwrap_err();
+     }
+ 
++    #[test]
++    #[cfg(target_arch = "riscv64")]
++    fn test_get_isa_extensions() {
++        use super::*;
++
++        let kvm = KvmHypervisor::new().unwrap();
++        let hypervisor = Arc::new(kvm);
++        let vm = hypervisor
++            .create_vm(HypervisorVmConfig::default())
++            .expect("new VM fd creation failed");
++        let vcpu0 = vm.create_vcpu(0, None).unwrap();
++
++        let extensions = vcpu0.get_isa_extensions().unwrap();
++        // The base ISA is always available to the guest.
++        for base in ["i", "m", "a"] {
++            assert!(extensions.iter().any(|e| e == base), "{extensions:?}");
++        }
++        // Every extension is reported once, with its devicetree name.
++        for (i, extension) in extensions.iter().enumerate() {
++            assert!(riscv64::ISA_EXT_NAMES.contains(&extension.as_str()));
++            assert!(!extensions[i + 1..].contains(extension));
++        }
++    }
++
+     #[test]
+     #[cfg(target_arch = "riscv64")]
+     fn test_get_and_set_regs() {
+diff --git a/hypervisor/src/kvm/riscv64/mod.rs b/hypervisor/src/kvm/riscv64/mod.rs
+index f14e5258d..ea51573a7 100644
+--- a/hypervisor/src/kvm/riscv64/mod.rs
++++ b/hypervisor/src/kvm/riscv64/mod.rs
+@@ -5,8 +5,9 @@
+ pub mod aia;
+ 
+ use kvm_bindings::{
+-    KVM_REG_RISCV_CORE, KVM_REG_RISCV_TYPE_MASK, KVM_REG_SIZE_MASK, KVM_REG_SIZE_U64, kvm_mp_state,
+-    kvm_one_reg, kvm_riscv_core,
++    KVM_REG_RISCV, KVM_REG_RISCV_CORE, KVM_REG_RISCV_ISA_EXT, KVM_REG_RISCV_ISA_SINGLE,
++    KVM_REG_RISCV_TYPE_MASK, KVM_REG_SIZE_MASK, KVM_REG_SIZE_U64, kvm_mp_state, kvm_one_reg,
++    kvm_riscv_core,
+ };
+ pub use kvm_ioctls::{Cap, Kvm};
+ use serde::{Deserialize, Serialize};
+@@ -78,6 +79,100 @@ macro_rules! riscv64_reg_id {
+     };
+ }
+ 
++/// Devicetree names of the KVM ISA extensions, indexed by `enum KVM_RISCV_ISA_EXT_ID`
++/// (arch/riscv/include/uapi/asm/kvm.h). The enum is uAPI, so it is append-only.
++pub const ISA_EXT_NAMES: &[&str] = &[
++    "a",
++    "c",
++    "d",
++    "f",
++    "h",
++    "i",
++    "m",
++    "svpbmt",
++    "sstc",
++    "svinval",
++    "zihintpause",
++    "zicbom",
++    "zicboz",
++    "zbb",
++    "ssaia",
++    "v",
++    "svnapot",
++    "zba",
++    "zbs",
++    "zicntr",
++    "zicsr",
++    "zifencei",
++    "zihpm",
++    "smstateen",
++    "zicond",
++    "zbc",
++    "zbkb",
++    "zbkc",
++    "zbkx",
++    "zknd",
++    "zkne",
++    "zknh",
++    "zkr",
++    "zksed",
++    "zksh",
++    "zkt",
++    "zvbb",
++    "zvbc",
++    "zvkb",
++    "zvkg",
++    "zvkned",
++    "zvknha",
++    "zvknhb",
++    "zvksed",
++    "zvksh",
++    "zvkt",
++    "zfh",
++    "zfhmin",
++    "zihintntl",
++    "zvfh",
++    "zvfhmin",
++    "zfa",
++    "ztso",
++    "zacas",
++    "sscofpmf",
++    "zimop",
++    "zca",
++    "zcb",
++    "zcd",
++    "zcf",
++    "zcmop",
++    "zawrs",
++    "smnpm",
++    "ssnpm",
++    "svade",
++    "svadu",
++    "svvptc",
++    "zabha",
++    "ziccrse",
++    "zaamo",
++    "zalrsc",
++    "zicbop",
++    "zfbfmin",
++    "zvfbfmin",
++    "zvfbfwma",
++    "zclsd",
++    "zilsd",
++    "zalasr",
++    "zicfilp",
++    "zicfiss",
++];
++
++/// Get the ID of the single-extension `KVM_REG_RISCV_ISA_EXT` register for `index`.
++pub fn isa_ext_reg_id(index: u64) -> u64 {
++    KVM_REG_RISCV as u64
++        | KVM_REG_SIZE_U64
++        | u64::from(KVM_REG_RISCV_ISA_EXT)
++        | u64::from(KVM_REG_RISCV_ISA_SINGLE)
++        | index
++}
++
+ /// Specifies whether a particular register is a core register or not.
+ ///
+ /// # Arguments
+diff --git a/vmm/src/cpu.rs b/vmm/src/cpu.rs
+index 17db8260a..24434e64e 100644
+--- a/vmm/src/cpu.rs
++++ b/vmm/src/cpu.rs
+@@ -673,6 +673,13 @@ pub fn get_timebase_frequency(&self) -> result::Result<u64, hypervisor::Hypervis
+         self.vcpu.get_timebase_frequency()
+     }
+ 
++    #[cfg(target_arch = "riscv64")]
++    pub fn get_isa_extensions(
++        &self,
++    ) -> result::Result<Vec<String>, hypervisor::HypervisorCpuError> {
++        self.vcpu.get_isa_extensions()
++    }
++
+     #[cfg(feature = "sev_snp")]
+     pub fn set_sev_control_register(&self, vmsa_pfn: u64) -> Result<()> {
+         self.vcpu
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index 6765b00f2..4c0d59f84 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -1938,6 +1938,16 @@ fn configure_system(&mut self) -> Result<()> {
+             .map(|f| f as u32)
+             .unwrap_or(0x989680);
+ 
++        // An empty list makes arch fall back to the host ISA from /proc/cpuinfo.
++        let isa_extensions = self
++            .cpu_manager
++            .lock()
++            .unwrap()
++            .vcpus()
++            .first()
++            .and_then(|vcpu| vcpu.lock().unwrap().get_isa_extensions().ok())
++            .unwrap_or_default();
++
+         arch::configure_system(
+             &mem,
+             cmdline.as_cstring().unwrap().to_str().unwrap(),
+@@ -1947,6 +1957,7 @@ fn configure_system(&mut self) -> Result<()> {
+             &pci_space_info,
+             &vaia,
+             timebase_frequency,
++            &isa_extensions,
+         )
+         .map_err(Error::ConfigureSystem)?;
+ 
+-- 
+2.56.0
+

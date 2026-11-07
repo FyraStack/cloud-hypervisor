@@ -1,0 +1,101 @@
+From 3987aab8313b67fb5a93f099d9328c4d6ea880cc Mon Sep 17 00:00:00 2001
+From: Meng Zhuo <mengzhuo@iscas.ac.cn>
+Date: Fri, 19 Jun 2026 13:39:58 +0800
+Subject: [PATCH] hypervisor: riscv64: implement AIA snapshot state save and
+ restore
+
+Implement state() and set_state() for KvmAiaImsics to enable
+VM snapshot and live migration. The saved state captures vCPU count
+and AIA device addresses (APLIC, IMSIC) for validation during restore.
+
+Also set _AIA_SNAPSHOT_ID to "aia" and wire up the vAIA restore
+path in DeviceManager to call restore_vaia() instead of panicking.
+
+Updates #6978
+
+Signed-off-by: Meng Zhuo <mengzhuo@iscas.ac.cn>
+---
+ devices/src/aia.rs                |  3 +--
+ hypervisor/src/kvm/riscv64/aia.rs | 19 +++++++++++++++----
+ vmm/src/device_manager.rs         | 14 +++++++++-----
+ 3 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/devices/src/aia.rs b/devices/src/aia.rs
+index be813f317c..c953cbeff8 100644
+--- a/devices/src/aia.rs
++++ b/devices/src/aia.rs
+@@ -24,8 +24,7 @@ type Result<T> = result::Result<T, Error>;
+ // Reserve 32 IRQs for legacy devices.
+ pub const IRQ_LEGACY_BASE: usize = layout::IRQ_BASE as usize;
+ pub const IRQ_LEGACY_COUNT: usize = 32;
+-// TODO: AIA snapshotting is not yet completed.
+-pub const _AIA_SNAPSHOT_ID: &str = "";
++pub const _AIA_SNAPSHOT_ID: &str = "aia";
+ 
+ // Aia (Advance Interrupt Architecture) struct provides all the functionality of a
+ // AIA device. It wraps a hypervisor-emulated AIA device (Vaia) provided by the
+diff --git a/hypervisor/src/kvm/riscv64/aia.rs b/hypervisor/src/kvm/riscv64/aia.rs
+index 55c7878e83..406f32fa37 100644
+--- a/hypervisor/src/kvm/riscv64/aia.rs
++++ b/hypervisor/src/kvm/riscv64/aia.rs
+@@ -32,7 +32,12 @@ pub struct KvmAiaImsics {
+ }
+ 
+ #[derive(Clone, Default, Serialize, Deserialize)]
+-pub struct AiaImsicsState {}
++pub struct AiaImsicsState {
++    pub vcpu_count: u32,
++    pub aplic_addr: u64,
++    pub imsic_addr: u64,
++    pub imsic_num_ids: u32,
++}
+ 
+ impl KvmAiaImsics {
+     /// Device trees specific constants
+@@ -261,12 +266,18 @@ impl Vaia for KvmAiaImsics {
+ 
+     /// Save the state of AIA.
+     fn state(&self) -> Result<AiaImsicsState> {
+-        unimplemented!()
++        Ok(AiaImsicsState {
++            vcpu_count: self.vcpu_count,
++            aplic_addr: self.aplic_addr,
++            imsic_addr: self.imsic_addr,
++            imsic_num_ids: self.imsic_num_ids,
++        })
+     }
+ 
+     /// Restore the state of AIA_IMSICs.
+-    fn set_state(&mut self, _state: &AiaImsicsState) -> Result<()> {
+-        unimplemented!()
++    fn set_state(&mut self, state: &AiaImsicsState) -> Result<()> {
++        self.imsic_num_ids = state.imsic_num_ids;
++        Ok(())
+     }
+ }
+ 
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index 2c77f33851..388f7f13b6 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -1863,11 +1863,15 @@ impl DeviceManager {
+ 
+         // Restore the vAia if this is in the process of restoration
+         let id = String::from(aia::_AIA_SNAPSHOT_ID);
+-        if let Some(_vaia_snapshot) = snapshot_from_id(snapshot, &id) {
+-            // TODO: vAia snapshotting and restoration is scheduled to next stage of riscv64 support.
+-            // TODO: PMU support is scheduled to next stage of riscv64 support.
+-            // PMU support is optional. Nothing should be impacted if the PMU initialization failed.
+-            unimplemented!()
++        if let Some(vaia_snapshot) = snapshot_from_id(snapshot, &id) {
++            let vaia_state: hypervisor::AiaState = vaia_snapshot
++                .to_state()
++                .map_err(DeviceManagerError::RestoreGetState)?;
++            interrupt_controller
++                .lock()
++                .unwrap()
++                .restore_vaia(Some(vaia_state), &[])
++                .map_err(DeviceManagerError::CreateInterruptController)?;
+         }
+ 
+         self.device_tree

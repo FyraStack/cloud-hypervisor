@@ -1,0 +1,334 @@
+From 68c8acf4636f0f2dedb0e489b1f4ecf567da691d Mon Sep 17 00:00:00 2001
+From: Meng Zhuo <mengzhuo@iscas.ac.cn>
+Date: Fri, 19 Jun 2026 13:39:58 +0800
+Subject: [PATCH] hypervisor: riscv64: implement AIA snapshot state save and
+ restore
+
+Implement state() and set_state() for KvmAiaImsics to enable
+VM snapshot and live migration. The saved state captures vCPU count
+and AIA device addresses (APLIC, IMSIC) for validation during restore.
+
+Also set _AIA_SNAPSHOT_ID to "aia" and wire up the vAIA restore
+path in DeviceManager to call restore_vaia() instead of panicking.
+
+Signed-off-by: Meng Zhuo <mengzhuo@iscas.ac.cn>
+---
+ devices/src/aia.rs                |  17 +++-
+ hypervisor/src/kvm/mod.rs         |  41 +++++++---
+ hypervisor/src/kvm/riscv64/aia.rs | 125 ++++++++++++++++++++++++++++--
+ hypervisor/src/kvm/riscv64/mod.rs |   9 +--
+ vmm/src/device_manager.rs         |  14 ++--
+ 5 files changed, 175 insertions(+), 31 deletions(-)
+
+diff --git a/devices/src/aia.rs b/devices/src/aia.rs
+index be813f317c..dad2ca3111 100644
+--- a/devices/src/aia.rs
++++ b/devices/src/aia.rs
+@@ -14,7 +14,7 @@ use vm_device::interrupt::{
+     LegacyIrqSourceConfig, MsiIrqGroupConfig,
+ };
+ use vm_memory::address::Address;
+-use vm_migration::{Migratable, Pausable, Snapshottable, Transportable};
++use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
+ use vmm_sys_util::eventfd::EventFd;
+ 
+ use super::interrupt_controller::{Error, InterruptController};
+@@ -24,8 +24,7 @@ type Result<T> = result::Result<T, Error>;
+ // Reserve 32 IRQs for legacy devices.
+ pub const IRQ_LEGACY_BASE: usize = layout::IRQ_BASE as usize;
+ pub const IRQ_LEGACY_COUNT: usize = 32;
+-// TODO: AIA snapshotting is not yet completed.
+-pub const _AIA_SNAPSHOT_ID: &str = "";
++pub const _AIA_SNAPSHOT_ID: &str = "aia";
+ 
+ // Aia (Advance Interrupt Architecture) struct provides all the functionality of a
+ // AIA device. It wraps a hypervisor-emulated AIA device (Vaia) provided by the
+@@ -138,7 +137,17 @@ impl InterruptController for Aia {
+     }
+ }
+ 
+-impl Snapshottable for Aia {}
++impl Snapshottable for Aia {
++    fn id(&self) -> String {
++        _AIA_SNAPSHOT_ID.to_string()
++    }
++
++    fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
++        let vaia = self.vaia.clone();
++        let state = vaia.lock().unwrap().state().unwrap();
++        Snapshot::new_from_state(&state)
++    }
++}
+ impl Pausable for Aia {}
+ impl Transportable for Aia {}
+ impl Migratable for Aia {}
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index 788767ec11..46fd83772a 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -3150,11 +3150,21 @@ impl cpu::Vcpu for KvmVcpu {
+         state.core_regs = self.get_regs()?.into();
+ 
+         // Call KVM_GET_REG_LIST to get all registers available to the guest.
+-        // ARM64_REGS_MAX in kvm-bindings caps this at 500.
+-        let mut reg_list = kvm_bindings::RegList::new(500).unwrap();
+-        self.fd
+-            .get_reg_list(&mut reg_list)
+-            .map_err(|e| cpu::HypervisorCpuError::GetRegList(e.into()))?;
++        // Start with 500 (ARM64_REGS_MAX) and retry with actual count on E2BIG.
++        let mut n = 500;
++        let reg_list = loop {
++            let mut rl = kvm_bindings::RegList::new(n)
++                .map_err(|e| cpu::HypervisorCpuError::GetRegList(e.into()))?;
++            match self.fd.get_reg_list(&mut rl) {
++                Ok(()) => break rl,
++                Err(e) if e.errno() == libc::E2BIG => {
++                    n = rl.as_fam_struct_ref().n as usize;
++                }
++                Err(e) => {
++                    return Err(cpu::HypervisorCpuError::GetRegList(e.into()));
++                }
++            }
++        };
+ 
+         let mut sys_regs: Vec<kvm_bindings::kvm_one_reg> = Vec::new();
+         let mut pre_finalize_regs: Vec<ExtendedReg> = Vec::new();
+@@ -3221,12 +3231,23 @@ impl cpu::Vcpu for KvmVcpu {
+ 
+         // Get non-core register
+         // Call KVM_GET_REG_LIST to get all registers available to the guest.
+-        // For RISC-V 64-bit there are around 200 registers.
++        // For RISC-V 64-bit with AIA there are around 237 registers.
++        let mut n = 300;
++        let mut reg_list = loop {
++            let mut rl = kvm_bindings::RegList::new(n)
++                .map_err(|e| cpu::HypervisorCpuError::GetRegList(e.into()))?;
++            match self.fd.get_reg_list(&mut rl) {
++                Ok(()) => break rl,
++                Err(e) if e.errno() == libc::E2BIG => {
++                    n = rl.as_fam_struct_ref().n as usize;
++                }
++                Err(e) => {
++                    return Err(cpu::HypervisorCpuError::GetRegList(e.into()));
++                }
++            }
++        };
++
+         let mut sys_regs: Vec<kvm_bindings::kvm_one_reg> = Vec::new();
+-        let mut reg_list = kvm_bindings::RegList::new(200).unwrap();
+-        self.fd
+-            .get_reg_list(&mut reg_list)
+-            .map_err(|e| cpu::HypervisorCpuError::GetRegList(e.into()))?;
+ 
+         // At this point reg_list should contain:
+         // - core registers
+diff --git a/hypervisor/src/kvm/riscv64/aia.rs b/hypervisor/src/kvm/riscv64/aia.rs
+index 55c7878e83..66d2ebcf13 100644
+--- a/hypervisor/src/kvm/riscv64/aia.rs
++++ b/hypervisor/src/kvm/riscv64/aia.rs
+@@ -31,8 +31,20 @@ pub struct KvmAiaImsics {
+     imsic_num_ids: u32,
+ }
+ 
++/// Snapshot state for the RISC-V AIA (APLIC + IMSIC) device.
++///
++/// Saves the full register state to support live migration.
++/// Only non-zero registers are stored to keep the snapshot compact.
+ #[derive(Clone, Default, Serialize, Deserialize)]
+-pub struct AiaImsicsState {}
++pub struct AiaImsicsState {
++    imsic_num_ids: u32,
++    /// APLIC register snapshot: sparse (offset, value) pairs.
++    /// Offset is the 4-byte-aligned MMIO offset in range 0x0000..=0x3FFC.
++    aplic_regs: Vec<(u32, u32)>,
++    /// IMSIC register snapshot: sparse (vcpu_index, iselect, value) tuples.
++    /// iselect is the register selector in range 0x70..=0xFF.
++    imsic_regs: Vec<(u32, u32, u32)>,
++}
+ 
+ impl KvmAiaImsics {
+     /// Device trees specific constants
+@@ -195,6 +207,54 @@ impl KvmAiaImsics {
+         })
+     }
+ 
++    fn get_aplic_reg(&self, offset: u32) -> Result<u32> {
++        let mut val: u32 = 0;
++        Self::get_device_attribute(
++            &self.device,
++            kvm_bindings::KVM_DEV_RISCV_AIA_GRP_APLIC,
++            offset as u64,
++            &raw mut val as u64,
++            0,
++        )?;
++        Ok(val)
++    }
++
++    fn set_aplic_reg(&self, offset: u32, value: u32) -> Result<()> {
++        Self::set_device_attribute(
++            &self.device,
++            kvm_bindings::KVM_DEV_RISCV_AIA_GRP_APLIC,
++            offset as u64,
++            &raw const value as u64,
++            0,
++        )
++    }
++
++    fn get_imsic_reg(&self, vcpu_id: u32, iselect: u32) -> Result<u32> {
++        let attr = ((vcpu_id as u64) << kvm_bindings::KVM_DEV_RISCV_AIA_IMSIC_ISEL_BITS)
++            | (iselect as u64);
++        let mut val: u32 = 0;
++        Self::get_device_attribute(
++            &self.device,
++            kvm_bindings::KVM_DEV_RISCV_AIA_GRP_IMSIC,
++            attr,
++            &raw mut val as u64,
++            0,
++        )?;
++        Ok(val)
++    }
++
++    fn set_imsic_reg(&self, vcpu_id: u32, iselect: u32, value: u32) -> Result<()> {
++        let attr = ((vcpu_id as u64) << kvm_bindings::KVM_DEV_RISCV_AIA_IMSIC_ISEL_BITS)
++            | (iselect as u64);
++        Self::set_device_attribute(
++            &self.device,
++            kvm_bindings::KVM_DEV_RISCV_AIA_GRP_IMSIC,
++            attr,
++            &raw const value as u64,
++            0,
++        )
++    }
++
+     /// Method to initialize the AIA device
+     pub fn new(vm: &dyn Vm, config: &VaiaConfig) -> Result<KvmAiaImsics> {
+         // This is inside KVM module
+@@ -259,21 +319,54 @@ impl Vaia for KvmAiaImsics {
+         self
+     }
+ 
+-    /// Save the state of AIA.
+     fn state(&self) -> Result<AiaImsicsState> {
+-        unimplemented!()
++        let mut aplic_regs = Vec::new();
++        for offset in (0..=0x3FFCu32).step_by(4) {
++            match self.get_aplic_reg(offset) {
++                Ok(val) if val != 0 => aplic_regs.push((offset, val)),
++                Ok(_) => {}
++                Err(_) => break,
++            }
++        }
++
++        // Valid IMSIC iselects vary by word size:
++        //   32-bit: 0x70, 0x72, 0x80..=0xFF (130 registers)
++        //   64-bit: 0x70, 0x72, 0x80/0x82/.../0xBE, 0xC0/0xC2/.../0xFE (66 registers)
++        // Iterate the full range and skip invalid iselects (kernel returns ENOENT/EINVAL).
++        let mut imsic_regs = Vec::new();
++        for vcpu_id in 0..self.vcpu_count {
++            for iselect in 0x70u32..=0xFF {
++                match self.get_imsic_reg(vcpu_id, iselect) {
++                    Ok(val) if val != 0 => imsic_regs.push((vcpu_id, iselect, val)),
++                    Ok(_) => {}
++                    Err(_) => {}
++                }
++            }
++        }
++
++        Ok(AiaImsicsState {
++            imsic_num_ids: self.imsic_num_ids,
++            aplic_regs,
++            imsic_regs,
++        })
+     }
+ 
+-    /// Restore the state of AIA_IMSICs.
+-    fn set_state(&mut self, _state: &AiaImsicsState) -> Result<()> {
+-        unimplemented!()
++    fn set_state(&mut self, state: &AiaImsicsState) -> Result<()> {
++        self.imsic_num_ids = state.imsic_num_ids;
++        for &(offset, value) in &state.aplic_regs {
++            self.set_aplic_reg(offset, value)?;
++        }
++        for &(vcpu_id, iselect, value) in &state.imsic_regs {
++            self.set_imsic_reg(vcpu_id, iselect, value)?;
++        }
++        Ok(())
+     }
+ }
+ 
+ #[cfg(test)]
+ mod unit_tests {
+     use crate::HypervisorVmConfig;
+-    use crate::arch::riscv64::aia::VaiaConfig;
++    use crate::arch::riscv64::aia::{Vaia, VaiaConfig};
+     use crate::kvm::KvmAiaImsics;
+ 
+     fn create_test_vaia_config() -> VaiaConfig {
+@@ -294,4 +387,22 @@ mod unit_tests {
+         let vaia_config = create_test_vaia_config();
+         assert!(KvmAiaImsics::new(&*vm, &vaia_config).is_ok());
+     }
++
++    #[test]
++    fn test_state_roundtrip() {
++        let hv = crate::new().unwrap();
++        let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
++        let _vcpu = vm.create_vcpu(0, None).unwrap();
++
++        let vaia_config = create_test_vaia_config();
++        let mut vaia = KvmAiaImsics::new(&*vm, &vaia_config).unwrap();
++
++        let saved = vaia.state().unwrap();
++        vaia.set_state(&saved).unwrap();
++
++        let restored = vaia.state().unwrap();
++        assert_eq!(restored.imsic_num_ids, saved.imsic_num_ids);
++        assert_eq!(restored.aplic_regs.len(), saved.aplic_regs.len());
++        assert_eq!(restored.imsic_regs.len(), saved.imsic_regs.len());
++    }
+ }
+diff --git a/hypervisor/src/kvm/riscv64/mod.rs b/hypervisor/src/kvm/riscv64/mod.rs
+index 07f54efb3d..81e418142a 100644
+--- a/hypervisor/src/kvm/riscv64/mod.rs
++++ b/hypervisor/src/kvm/riscv64/mod.rs
+@@ -89,11 +89,10 @@ pub fn is_non_core_register(regid: u64) -> bool {
+     }
+ 
+     let size = regid & KVM_REG_SIZE_MASK;
+-
+-    assert!(
+-        size == KVM_REG_SIZE_U64,
+-        "Unexpected register size for system register {size}"
+-    );
++    if size != KVM_REG_SIZE_U64 {
++        // Skip non-U64 registers (U32 timer regs, etc.)
++        return false;
++    }
+ 
+     true
+ }
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index 2c77f33851..388f7f13b6 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -1863,11 +1863,15 @@ impl DeviceManager {
+ 
+         // Restore the vAia if this is in the process of restoration
+         let id = String::from(aia::_AIA_SNAPSHOT_ID);
+-        if let Some(_vaia_snapshot) = snapshot_from_id(snapshot, &id) {
+-            // TODO: vAia snapshotting and restoration is scheduled to next stage of riscv64 support.
+-            // TODO: PMU support is scheduled to next stage of riscv64 support.
+-            // PMU support is optional. Nothing should be impacted if the PMU initialization failed.
+-            unimplemented!()
++        if let Some(vaia_snapshot) = snapshot_from_id(snapshot, &id) {
++            let vaia_state: hypervisor::AiaState = vaia_snapshot
++                .to_state()
++                .map_err(DeviceManagerError::RestoreGetState)?;
++            interrupt_controller
++                .lock()
++                .unwrap()
++                .restore_vaia(Some(vaia_state), &[])
++                .map_err(DeviceManagerError::CreateInterruptController)?;
+         }
+ 
+         self.device_tree

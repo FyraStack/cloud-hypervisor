@@ -1,0 +1,189 @@
+From a4ac3a4c4f93c8626b96d229159da905cc596b5b Mon Sep 17 00:00:00 2001
+From: Caleb Jones <caleb@calebgj.io>
+Date: Wed, 28 Oct 2026 23:26:11 +0000
+Subject: [PATCH 7/8] hypervisor: riscv64: Report which AIA device attribute
+ failed
+
+When KVM rejected one of the AIA device attributes, the error didn't say
+which one, and it was flattened into a Debug string:
+
+  Vaia error SetDeviceAttribute(SetDeviceAttribute(Invalid argument (os error 22)))
+
+which made platform limits hard to diagnose (e.g. KVM rejecting the
+number of wired interrupt sources on hosts with few guest MSI
+identities).
+
+Name the attribute in the get/set errors, together with its group and
+attribute number, and keep the AIA error as the source of the VM error,
+so the error chain reads e.g.:
+
+  Failed setting AIA device attribute config srcs (group 0, attr 2)
+  Failed to set device attribute
+  Invalid argument (os error 22)
+
+Signed-off-by: Caleb Jones <caleb@calebgj.io>
+---
+ hypervisor/src/arch/riscv64/aia.rs | 20 +++++++++++++++----
+ hypervisor/src/kvm/mod.rs          |  2 +-
+ hypervisor/src/kvm/riscv64/aia.rs  | 31 ++++++++++++++++++++++++------
+ 3 files changed, 42 insertions(+), 11 deletions(-)
+
+diff --git a/hypervisor/src/arch/riscv64/aia.rs b/hypervisor/src/arch/riscv64/aia.rs
+index ad076ceab..b544603ab 100644
+--- a/hypervisor/src/arch/riscv64/aia.rs
++++ b/hypervisor/src/arch/riscv64/aia.rs
+@@ -15,11 +15,23 @@ pub enum Error {
+     #[error("Failed creating AIA device")]
+     CreateAia(#[source] HypervisorVmError),
+     /// Error while setting device attributes for the AIA.
+-    #[error("Failed setting device attributes for the AIA")]
+-    SetDeviceAttribute(#[source] HypervisorDeviceError),
++    #[error("Failed setting AIA device attribute {name} (group {group}, attr {attr})")]
++    SetDeviceAttribute {
++        name: &'static str,
++        group: u32,
++        attr: u64,
++        #[source]
++        source: HypervisorDeviceError,
++    },
+     /// Error while getting device attributes for the AIA.
+-    #[error("Failed getting device attributes for the AIA")]
+-    GetDeviceAttribute(#[source] HypervisorDeviceError),
++    #[error("Failed getting AIA device attribute {name} (group {group}, attr {attr})")]
++    GetDeviceAttribute {
++        name: &'static str,
++        group: u32,
++        attr: u64,
++        #[source]
++        source: HypervisorDeviceError,
++    },
+ }
+ pub type Result<T> = result::Result<T, Error>;
+ 
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index 07886a98c..c12d15427 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -868,7 +868,7 @@ fn create_vgic(&self, config: &VgicConfig) -> vm::Result<Arc<Mutex<dyn Vgic>>> {
+     /// Creates a virtual AIA device.
+     fn create_vaia(&self, config: &VaiaConfig) -> vm::Result<Arc<Mutex<dyn Vaia>>> {
+         let aia_device = KvmAiaImsics::new(self, config)
+-            .map_err(|e| vm::HypervisorVmError::CreateVaia(anyhow!("Vaia error {e:?}")))?;
++            .map_err(|e| vm::HypervisorVmError::CreateVaia(e.into()))?;
+         Ok(Arc::new(Mutex::new(aia_device)))
+     }
+ 
+diff --git a/hypervisor/src/kvm/riscv64/aia.rs b/hypervisor/src/kvm/riscv64/aia.rs
+index 5b91a3aed..2bf576bc5 100644
+--- a/hypervisor/src/kvm/riscv64/aia.rs
++++ b/hypervisor/src/kvm/riscv64/aia.rs
+@@ -46,6 +46,7 @@ fn init_device_attributes(&mut self, nr_irqs: u32) -> Result<()> {
+         let mut aia_mode_readback: u32 = 0;
+         Self::get_device_attribute(
+             &self.device,
++            "config mode",
+             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
+             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_MODE),
+             &raw mut aia_mode_readback as u64,
+@@ -59,6 +60,7 @@ fn init_device_attributes(&mut self, nr_irqs: u32) -> Result<()> {
+         let mut aia_nr_ids: u32 = 0;
+         Self::get_device_attribute(
+             &self.device,
++            "config ids",
+             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
+             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_IDS),
+             &raw mut aia_nr_ids as u64,
+@@ -74,6 +76,7 @@ fn init_device_attributes(&mut self, nr_irqs: u32) -> Result<()> {
+         );
+         Self::set_device_attribute(
+             &self.device,
++            "config srcs",
+             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
+             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_SRCS),
+             &raw const safe_nr_irqs as u64,
+@@ -86,6 +89,7 @@ fn init_device_attributes(&mut self, nr_irqs: u32) -> Result<()> {
+         debug!("Configuring AIA hart bits: {}", hart_bits);
+         Self::set_device_attribute(
+             &self.device,
++            "config hart bits",
+             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
+             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CONFIG_HART_BITS),
+             &raw const hart_bits as u64,
+@@ -98,6 +102,7 @@ fn init_device_attributes(&mut self, nr_irqs: u32) -> Result<()> {
+         debug!("Configuring AIA APLIC address: {:#x}", self.aplic_addr);
+         Self::set_device_attribute(
+             &self.device,
++            "APLIC address",
+             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_ADDR,
+             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_ADDR_APLIC),
+             &raw const self.aplic_addr as u64,
+@@ -119,6 +124,7 @@ fn init_device_attributes(&mut self, nr_irqs: u32) -> Result<()> {
+             );
+             Self::set_device_attribute(
+                 &self.device,
++                "IMSIC address",
+                 kvm_bindings::KVM_DEV_RISCV_AIA_GRP_ADDR,
+                 riscv_imsic_attr_of(cpu_index),
+                 &raw const cpu_imsic_addr as u64,
+@@ -130,6 +136,7 @@ fn init_device_attributes(&mut self, nr_irqs: u32) -> Result<()> {
+         debug!("Initializing AIA device");
+         Self::set_device_attribute(
+             &self.device,
++            "init",
+             kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CTRL,
+             u64::from(kvm_bindings::KVM_DEV_RISCV_AIA_CTRL_INIT),
+             0,
+@@ -156,6 +163,7 @@ fn create_device(vm: &KvmVm) -> Result<DeviceFd> {
+     /// Get an AIA device attribute
+     fn get_device_attribute(
+         device: &DeviceFd,
++        name: &'static str,
+         group: u32,
+         attr: u64,
+         addr: u64,
+@@ -169,15 +177,21 @@ fn get_device_attribute(
+         };
+         // SAFETY: attr.addr is safe to write to.
+         unsafe {
+-            device.get_device_attr(&mut attr).map_err(|e| {
+-                Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
+-            })
++            device
++                .get_device_attr(&mut attr)
++                .map_err(|e| Error::GetDeviceAttribute {
++                    name,
++                    group,
++                    attr: attr.attr,
++                    source: HypervisorDeviceError::GetDeviceAttribute(e.into()),
++                })
+         }
+     }
+ 
+     /// Set an AIA device attribute
+     fn set_device_attribute(
+         device: &DeviceFd,
++        name: &'static str,
+         group: u32,
+         attr: u64,
+         addr: u64,
+@@ -189,9 +203,14 @@ fn set_device_attribute(
+             attr,
+             addr,
+         };
+-        device.set_device_attr(&attr).map_err(|e| {
+-            Error::SetDeviceAttribute(HypervisorDeviceError::SetDeviceAttribute(e.into()))
+-        })
++        device
++            .set_device_attr(&attr)
++            .map_err(|e| Error::SetDeviceAttribute {
++                name,
++                group,
++                attr: attr.attr,
++                source: HypervisorDeviceError::SetDeviceAttribute(e.into()),
++            })
+     }
+ 
+     /// Method to initialize the AIA device
+-- 
+2.56.0
+

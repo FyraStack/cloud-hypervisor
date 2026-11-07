@@ -1,0 +1,26 @@
+- https://github.com/cloud-hypervisor/cloud-hypervisor/issues/6978
+  / = agent thinks its already done, we need to test it
+  - easy
+    - [/] `arch/src/riscv64/fdt.rs`: Retrieve CPU frequency from cpu timer regs
+    - [/] `arch/src/riscv64/fdt.rs`: Complete `num-ids` determination
+    - [ ] `arch/src/riscv64/fdt.rs`: Complete `num-srcs` determination
+    - [ ] `devices/src/aia.rs`: Implement AIA snapshotting.
+      - unfinished, but there is a PR that is already partially written that was closed due to being stale 
+      - we can likely reuse this to get it fully finished
+      - https://github.com/cloud-hypervisor/cloud-hypervisor/pull/8452
+    - [ ] `devices/src/lib.rs`: Enable `TPM` device.
+  - hard
+    - [ ] `vmm/src/devices_manager.rs`: Enable `PMU`.
+    - [/] `vmm/src/vm.rs`: Enable `UEFI`.
+    - [/] `vmm/src/vm.rs`: Enable `IOMMU`.
+    - [/] `vmm/src/lib.rs`: Enable `ACPI`.
+
+
+AIA
+    https://github.com/mengzhuo/cloud-hypervisor/commit/59ab544142a85364fba32b7f8d29614cdcb1091e
+    https://github.com/cloud-hypervisor/cloud-hypervisor/pull/8452
+    https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3987aab8313b67fb5a93f099d9328c4d6ea880cc
+    https://github.com/cloud-hypervisor/cloud-hypervisor/pull/8452/commits/68c8acf4636f0f2dedb0e489b1f4ecf567da691d
+
+https://github.com/FyraStack/cloud-hypervisor/tree/riscv
+

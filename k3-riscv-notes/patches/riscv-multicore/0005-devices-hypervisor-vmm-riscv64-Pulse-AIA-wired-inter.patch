@@ -1,0 +1,174 @@
+From bb0f1be4cc1f059aa5c2c5d0738cc1b25b9b2183 Mon Sep 17 00:00:00 2001
+From: Caleb Jones <caleb@calebgj.io>
+Date: Wed, 28 Oct 2026 22:56:12 +0000
+Subject: [PATCH 5/8] devices, hypervisor, vmm: riscv64: Pulse AIA wired
+ interrupts
+
+Wired (legacy) interrupts were raised by signaling an irqfd routed to
+the APLIC. On riscv64, KVM handles such irqfds in atomic context with
+kvm_arch_set_irq_inatomic(), which only ever raises the line: unlike
+other architectures, the irqfd_inject() work that raises and then
+lowers it is never used. The APLIC source therefore stays asserted
+after the first interrupt.
+
+With the level-triggered serial port this causes an interrupt storm:
+Linux' APLIC MSI driver writes the source to setipnum_le at EOI to
+re-pend level-triggered interrupts that are still asserted (AIA spec
+4.9.2), which always succeeds. The guest saw ~100000 spurious serial
+interrupts within seconds of booting, then disabled the IRQ ("irq 11:
+nobody cared") and fell back to polling the console. An edge-triggered
+source would instead never fire again, as the input never goes low.
+
+Pulse the line with KVM_IRQ_LINE instead, as other VMMs do on riscv64,
+and allow that ioctl for the threads that emulate legacy devices.
+
+Signed-off-by: Caleb Jones <caleb@calebgj.io>
+---
+ devices/src/aia.rs         | 16 ++++++++++++----
+ hypervisor/src/kvm/mod.rs  |  8 ++++++++
+ hypervisor/src/vm.rs       |  7 +++++++
+ vmm/src/seccomp_filters.rs | 18 ++++++++++++++++--
+ 4 files changed, 43 insertions(+), 6 deletions(-)
+
+diff --git a/devices/src/aia.rs b/devices/src/aia.rs
+index 2834d6e56..61b779fdc 100644
+--- a/devices/src/aia.rs
++++ b/devices/src/aia.rs
+@@ -3,8 +3,8 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+ 
+-use std::result;
+ use std::sync::{Arc, Mutex};
++use std::{io, result};
+ 
+ use arch::layout;
+ use hypervisor::arch::riscv64::aia::{Vaia, VaiaConfig};
+@@ -35,6 +35,7 @@ pub struct Aia {
+     interrupt_source_group: Arc<dyn InterruptSourceGroup>,
+     // The hypervisor agnostic virtual AIA
+     vaia: Arc<Mutex<dyn Vaia>>,
++    vm: Arc<dyn hypervisor::Vm>,
+ }
+ 
+ impl Aia {
+@@ -57,6 +58,7 @@ pub fn new(
+         let aia = Aia {
+             interrupt_source_group,
+             vaia,
++            vm,
+         };
+         aia.enable()?;
+ 
+@@ -112,9 +114,15 @@ impl InterruptController for Aia {
+     // This should be called anytime an interrupt needs to be injected into the
+     // running guest.
+     fn service_irq(&mut self, irq: usize) -> Result<()> {
+-        self.interrupt_source_group
+-            .trigger(irq as InterruptIndex)
+-            .map_err(Error::TriggerInterrupt)?;
++        // Pulse the line instead of signaling the irqfd: KVM handles irqfds
++        // routed to the APLIC by raising the line without ever lowering it.
++        // The source then stays asserted, so a level-triggered interrupt is
++        // re-pended forever by the guest at EOI, and an edge-triggered one
++        // never fires again.
++        self.vm
++            .set_irq_line(irq as u32, true)
++            .and_then(|()| self.vm.set_irq_line(irq as u32, false))
++            .map_err(|e| Error::TriggerInterrupt(io::Error::other(e)))?;
+ 
+         Ok(())
+     }
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index 85224afae..07886a98c 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -872,6 +872,14 @@ fn create_vaia(&self, config: &VaiaConfig) -> vm::Result<Arc<Mutex<dyn Vaia>>> {
+         Ok(Arc::new(Mutex::new(aia_device)))
+     }
+ 
++    #[cfg(target_arch = "riscv64")]
++    /// Sets the level of an APLIC interrupt source.
++    fn set_irq_line(&self, irq: u32, level: bool) -> vm::Result<()> {
++        self.fd
++            .set_irq_line(irq, level)
++            .map_err(|e| vm::HypervisorVmError::SetIrqLine(e.into()))
++    }
++
+     /// Registers an event to be signaled whenever a certain address is written to.
+     fn register_ioevent(
+         &self,
+diff --git a/hypervisor/src/vm.rs b/hypervisor/src/vm.rs
+index 75219a404..b383a5a7f 100644
+--- a/hypervisor/src/vm.rs
++++ b/hypervisor/src/vm.rs
+@@ -73,6 +73,10 @@ pub enum HypervisorVmError {
+     /// Un register interrupt event error
+     #[error("Failed to unregister interrupt event")]
+     UnregisterIrqFd(#[source] anyhow::Error),
++    /// Set interrupt line level error
++    #[cfg(target_arch = "riscv64")]
++    #[error("Failed to set interrupt line level")]
++    SetIrqLine(#[source] anyhow::Error),
+     /// Register IO event error
+     #[error("Failed to register IO event")]
+     RegisterIoEvent(#[source] anyhow::Error),
+@@ -255,6 +259,9 @@ fn create_vcpu(
+     fn create_vgic(&self, config: &VgicConfig) -> Result<Arc<Mutex<dyn Vgic>>>;
+     #[cfg(target_arch = "riscv64")]
+     fn create_vaia(&self, config: &VaiaConfig) -> Result<Arc<Mutex<dyn Vaia>>>;
++    /// Sets the level of a wired interrupt source of the in-kernel interrupt controller.
++    #[cfg(target_arch = "riscv64")]
++    fn set_irq_line(&self, irq: u32, level: bool) -> Result<()>;
+ 
+     /// Registers an event to be signaled whenever a certain address is written to.
+     fn register_ioevent(
+diff --git a/vmm/src/seccomp_filters.rs b/vmm/src/seccomp_filters.rs
+index 0cab4bd63..104219fd5 100644
+--- a/vmm/src/seccomp_filters.rs
++++ b/vmm/src/seccomp_filters.rs
+@@ -561,10 +561,18 @@ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError>
+     Ok(arch_rules)
+ }
+ 
++// Wired interrupts are pulsed with KVM_IRQ_LINE on riscv64, from any thread
++// emulating a legacy device (see devices::aia::Aia::service_irq()).
++#[cfg(all(target_arch = "riscv64", feature = "kvm"))]
++const KVM_IRQ_LINE: u64 = 0x4008_ae61;
++
+ #[cfg(all(target_arch = "riscv64", feature = "kvm"))]
+ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError> {
++    let mut arch_rules = or![and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQ_LINE)?],];
+     let common_rules = create_vmm_ioctl_seccomp_rule_common(HypervisorType::Kvm)?;
+-    Ok(common_rules)
++    arch_rules.extend(common_rules);
++
++    Ok(arch_rules)
+ }
+ 
+ #[cfg(feature = "mshv")]
+@@ -588,7 +596,11 @@ fn create_api_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, BackendError> {
+ }
+ 
+ fn create_serial_manager_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, BackendError> {
+-    Ok(or![and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?]])
++    Ok(or![
++        and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?],
++        #[cfg(all(target_arch = "riscv64", feature = "kvm"))]
++        and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQ_LINE)?],
++    ])
+ }
+ 
+ // Syscalls needed by all threads, because they are used in the seccomp signal
+@@ -881,6 +893,8 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CHECK_EXTENSION,)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IOEVENTFD)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD,)?],
++        #[cfg(target_arch = "riscv64")]
++        and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQ_LINE)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GSI_ROUTING,)?],
+         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION,)?],
+-- 
+2.56.0
+
